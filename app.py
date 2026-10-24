@@ -9,9 +9,9 @@ st.set_page_config(
 )
 
 st.title("🚌 스마트 대중교통 실시간 안내판")
-st.caption("💡 인증키 자동 반영 및 정류소 이름 실시간 검색 서비스")
+st.caption("💡 한글 검색 및 보안 통신이 적용된 실시간 버스 정보 서비스")
 
-# 📌 세션 상태(Session State)를 활용해 인증키가 세션 동안 영구 유지되도록 설정
+# 📌 인증키 세션 유지 설정
 if "api_key" not in st.session_state:
   st.session_state.api_key = (
       "6e4f3ef02b705a609c52db54bb93f9399b194946978c606d2a6fbb4ac6242223"
@@ -41,17 +41,6 @@ station_name_query = st.text_input(
     placeholder="예: 오송역, 터미널 등 입력 후 검색",
 )
 
-
-def safe_api_request(url, params):
-  query_str = "&".join([f"{k}={v}" for k, v in params.items()])
-  full_url = f"{url}?{query_str}"
-  try:
-    res = requests.get(full_url, timeout=5)
-    return res
-  except Exception:
-    return None
-
-
 if st.button("실시간 버스 도착 정보 검색", key="btn_search"):
   current_key = st.session_state.api_key
 
@@ -60,21 +49,22 @@ if st.button("실시간 버스 도착 정보 검색", key="btn_search"):
   elif not station_name_query.strip():
     st.warning("정류소 이름을 입력해 주세요.")
   else:
-    with st.spinner("정류소 및 실시간 도착 정보를 불러오는 중입니다..."):
-      sttn_url = "http://apis.data.go.kr/1613000/BusSttnInfoInqireService/getSttnNoList"
-      sttn_params = {
-          "serviceKey": current_key,
-          "cityCode": city_code,
-          "nodeNm": station_name_query,
-          "numOfRows": "20",
-          "pageNo": "1",
-          "_type": "json",
-      }
+    with st.spinner("정류소 및 실시간 도착 정보를 찾는 중입니다..."):
+      try:
+        # 1단계: HTTPS 주소 사용 및 requests의 params 자동 인코딩 기능 활용
+        sttn_url = "https://apis.data.go.kr/1613000/BusSttnInfoInqireService/getSttnNoList"
+        sttn_params = {
+            "serviceKey": current_key,
+            "cityCode": city_code,
+            "nodeNm": station_name_query,
+            "numOfRows": "20",
+            "pageNo": "1",
+            "_type": "json",
+        }
 
-      res = safe_api_request(sttn_url, sttn_params)
+        res = requests.get(sttn_url, params=sttn_params, timeout=5)
 
-      if res and res.status_code == 200:
-        try:
+        if res.status_code == 200:
           data = res.json()
           body = data.get("response", {}).get("body", {})
           items_container = body.get("items", {})
@@ -100,7 +90,8 @@ if st.button("실시간 버스 도착 정보 검색", key="btn_search"):
             )
             chosen_node_id = station_options[chosen_station_label]
 
-            arvl_url = "http://apis.data.go.kr/1613000/ArvlInfoInqireService/getSttnAcctoArvlPregeInfoList"
+            # 2단계: 선택된 정류소의 실시간 도착 정보 조회
+            arvl_url = "https://apis.data.go.kr/1613000/ArvlInfoInqireService/getSttnAcctoArvlPregeInfoList"
             arvl_params = {
                 "serviceKey": current_key,
                 "cityCode": city_code,
@@ -110,8 +101,8 @@ if st.button("실시간 버스 도착 정보 검색", key="btn_search"):
                 "_type": "json",
             }
 
-            arvl_res = safe_api_request(arvl_url, arvl_params)
-            if arvl_res and arvl_res.status_code == 200:
+            arvl_res = requests.get(arvl_url, params=arvl_params, timeout=5)
+            if arvl_res.status_code == 200:
               arvl_data = arvl_res.json()
               arvl_body = arvl_data.get("response", {}).get("body", {})
               arvl_items_container = arvl_body.get("items", {})
@@ -141,17 +132,16 @@ if st.button("실시간 버스 도착 정보 검색", key="btn_search"):
                 )
               else:
                 st.info("현재 해당 정류소에 도착 예정인 버스 정보가 없습니다.")
+            else:
+              st.error("도착 정보를 불러오는 데 실패했습니다.")
           else:
             st.warning(
                 f"'{station_name_query}'에 해당하는 정류소를 찾지 못했습니다."
             )
-        except Exception as e:
-          st.error(f"데이터 처리 중 오류 발생: {e}")
+        else:
+          st.error(
+              f"API 통신 오류 (상태 코드: {res.status_code}). 서버 응답 내용:"
+          )
           st.code(res.text)
-      else:
-        st.error(
-            "API 서버 통신에 실패했습니다. 인증키 승인 상태를 다시 확인해"
-            " 주세요."
-        )
-        if res:
-          st.code(res.text)
+      except Exception as e:
+        st.error(f"데이터 처리 중 오류 발생: {e}")

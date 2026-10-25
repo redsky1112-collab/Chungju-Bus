@@ -60,7 +60,8 @@ def call_api(service, operation, **params):
       if msg:
         raise ApiError(
             f"API 인증/권한 오류: {msg}\n"
-            "→ 활용신청 승인 여부, 키 반영 대기(최대 1~2시간), 일일 트래픽 초과를 확인하세요."
+            "→ 활용신청 승인 여부, 키 반영 대기(최대 1~2시간), 일일 트래픽 초과를 확인하세요.\n\n"
+            f"앱이 보낸 요청 (폰에서 직접 열어 비교해 보세요): {res.url}"
         )
       raise ApiError(
           f"알 수 없는 응답 (HTTP {res.status_code}): {res.text[:300]}"
@@ -73,7 +74,8 @@ def call_api(service, operation, **params):
       msg = auth.get("returnAuthMsg") or auth.get("errMsg")
       raise ApiError(
           f"API 인증/권한 오류: {msg} (코드 {code}, HTTP {res.status_code})\n"
-          "→ 활용신청 승인 여부, 키 반영 대기(최대 1~2시간), 일일 트래픽 초과를 확인하세요."
+          "→ 활용신청 승인 여부, 키 반영 대기(최대 1~2시간), 일일 트래픽 초과를 확인하세요.\n\n"
+          f"앱이 보낸 요청 (폰에서 직접 열어 비교해 보세요): {res.url}"
       )
 
     header = data.get("response", {}).get("header", {})

@@ -11,15 +11,13 @@ st.set_page_config(
 )
 
 st.title("🚌 스마트 대중교통 경로 & 실시간 안내판")
-st.caption("💡 새 인증키 적용 완료! 실시간 정류소 및 버스 번호 안내 서비스")
+st.caption("💡 실시간 정류소 및 버스 번호 안내 서비스 (카카오맵 연동 복구)")
 
-# 📌 재발급받으신 신규 인증키 적용
 FIXED_API_KEY = (
     "9dee46a7fb260691759bcc48c371d7c750807ac380b0555594a696840e11bafe"
 )
 
 
-# 📌 API 지원 전체 도시 목록 불러오기
 @st.cache_data(ttl=3600)
 def get_city_list():
   try:
@@ -58,7 +56,7 @@ with tab1:
   st.subheader("🧭 출발 정류소 실시간 버스 번호 찾기")
   st.write(
       "탑승하실 **출발 정류소 이름**을 입력하시면, 해당 정류소를 경유하는 실시간"
-      " 버스 번호와 도착 예정 시간을 바로 확인하실 수 있습니다."
+      " 버스 번호와 도착 예정 시간을 확인하실 수 있습니다."
   )
 
   default_idx = 0
@@ -169,6 +167,7 @@ with tab1:
                       pd.DataFrame(rows), use_container_width=True
                   )
 
+                  # 🗺️ 카카오맵 연동 버튼 복구 완료
                   kakao_map_url = f"https://map.kakao.com/?sName={start_station}&eName={destination}"
                   st.link_button(
                       "🗺️ 카카오맵에서 목적지까지 상세 경로 보기",

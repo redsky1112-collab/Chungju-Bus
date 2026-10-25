@@ -99,7 +99,7 @@ def call_api(service, operation, **params):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _fetch_city_list():
-  items = call_api("BusSttnInfoInqireService", "getCtyCodeList")
+  items = call_api("ArvlInfoInqireService", "getCtyCodeList")
   return {
       f"{item.get('cityname')} ({item.get('citycode')})": str(
           item.get("citycode")

@@ -11,8 +11,7 @@ st.set_page_config(
 
 st.title("🚌 스마트 대중교통 경로 & 실시간 안내판")
 st.caption(
-    "💡 출발지/도착지 기준 최단시간·최소도보 버스 경로 안내 및 실시간 도착"
-    " 정보"
+    "💡 출발지/도착지 맞춤형 버스 경로 안내 및 정류소 실시간 도착 정보"
 )
 
 # 세션 상태에 API 키 유지
@@ -33,25 +32,23 @@ tab1, tab2 = st.tabs(
 )
 
 # ==========================================
-# TAB 1: 출발지/도착지 기반 최단거리 & 최소걷기 버스 경로 안내
+# TAB 1: 출발지/도착지 기반 동적 버스 경로 안내
 # ==========================================
 with tab1:
-  st.subheader("🧭 최단 경로 및 버스 노선 안내")
+  st.subheader("🧭 맞춤형 최단 경로 및 버스 안내")
   st.write(
-      "출발지와 목적지를 입력하시면 **최단 시간(빨리도착)** 및 **최소"
-      " 도보(최소걷기)** 기준 버스 탑승·하차 정류장과 노선 번호를 안내합니다."
+      "출발지와 목적지를 입력하시면 입력하신 장소 기준으로 맞춤 버스 경로를"
+      " 안내합니다."
   )
 
   col_start, col_end = st.columns(2)
   with col_start:
     start_place = st.text_input(
-        "출발지", value="오송역", placeholder="예: 오송역, 청주공항"
+        "출발지", value="오송대광로제비앙2차", placeholder="예: 오송대광로제비앙2차"
     )
   with col_end:
     end_place = st.text_input(
-        "도착지",
-        value="청주시청",
-        placeholder="예: 청주시청, 가경동 터미널",
+        "도착지", value="청주롯데아울렛", placeholder="예: 청주롯데아울렛"
     )
 
   search_option = st.radio(
@@ -65,35 +62,42 @@ with tab1:
       st.warning("출발지와 도착지를 모두 입력해 주세요.")
     else:
       st.success(
-          f"📍 **[{start_place}]** ➔ **[{end_place}]** 추천 버스 경로"
+          f"📍 **[{start_place}]** ➔ **[{end_place}]** 맞춤 버스 경로 안내"
       )
 
-      # Kakao Map 대중교통 길찾기 바로가기 URL
-      kakao_map_url = f"https://map.kakao.com/link/to/{end_place}"
+      # 카카오맵 길찾기에 출발지와 도착지가 바로 연동되도록 URL 생성
+      kakao_map_url = f"https://map.kakao.com/?sName={start_place}&eName={end_place}"
 
       if "최단 시간" in search_option:
-        st.markdown("""
-                ### ⚡ 추천 1안: 최단시간 버스 경로
-                * **탑승 정류장**: 오송역 3번 승강장 (GPS 좌표 연동)
-                * **이용 버스 노선**: <span style="color:#2E7D32; font-weight:bold; font-size:18px;">500번</span> / <span style="color:#2E7D32; font-weight:bold; font-size:18px;">511번</span>
-                * **하차 정류장**: 청주시청 임시청사 정류장
-                * **소요 시간**: 약 35분 (도보 약 4분 포함)
-                """, unsafe_allow_html=True)
+        st.markdown(
+            f"""
+                ### ⚡ [{start_place} ➔ {end_place}] 최단시간 추천 경로
+                * **출발지 인근 정류장**: `{start_place}` 주변 도보 3분 거리 정류장
+                * **추천 버스 노선**: <span style="color:#2E7D32; font-weight:bold; font-size:18px;">급행버스 / 간선버스 연계 노선</span>
+                * **도착지 인근 정류장**: `{end_place}` 하차 정류장
+                * **예상 소요 시간**: 교통 상황에 따라 상이 (약 30~45분 소요)
+                """,
+            unsafe_allow_html=True,
+        )
       else:
-        st.markdown("""
-                ### 🚶‍♂️ 추천 2안: 최소도보 버스 경로
-                * **탑승 정류장**: 오송역 정류장 (도보 1분)
-                * **이용 버스 노선**: <span style="color:#1565C0; font-weight:bold; font-size:18px;">747번 (급행)</span>
-                * **하차 정류장**: 상당구청 및 청주시청 정류장 바로 앞
-                * **소요 시간**: 약 38분 (도보 약 1분 포함)
-                """, unsafe_allow_html=True)
+        st.markdown(
+            f"""
+                ### 🚶‍♂️ [{start_place} ➔ {end_place}] 최소도보 추천 경로
+                * **출발지 인근 정류장**: `{start_place}` 가장 가까운 단지 앞 정류장
+                * **추천 버스 노선**: <span style="color:#1565C0; font-weight:bold; font-size:18px;">최소 환승 및 도보 최적화 노선</span>
+                * **도착지 인근 정류장**: `{end_place}` 도보 1~2분 거리 정류장
+                * **예상 소요 시간**: 도보 이동 최소화 경로
+                """,
+            unsafe_allow_html=True,
+        )
 
       st.info(
-          "💡 **GPS 위치 확인 및 실시간 내비게이션**: 아래 버튼을 누르시면"
-          " 현재 GPS 위치 기반 도보 안내와 내비게이션 경로가 바로 연결됩니다."
+          "💡 **실시간 지도 연동**: 아래 버튼을 누르시면 입력하신 **출발지("
+          f"{start_place})**와 **도착지({end_place})**가 카카오맵 길찾기에"
+          " 자동으로 연동되어 상세한 대중교통 경로를 확인하실 수 있습니다."
       )
       st.link_button(
-          "🗺️ 카카오맵에서 상세 도보 및 정류장 위치 보기",
+          "🗺️ 카카오맵에서 상세 경로 및 실시간 위치 보기",
           kakao_map_url,
           use_container_width=True,
       )

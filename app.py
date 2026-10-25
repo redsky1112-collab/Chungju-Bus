@@ -232,7 +232,7 @@ def _query_variants(query):
 @st.cache_data(ttl=86400, show_spinner=False)
 def all_stations(city_code):
   """도시의 전체 정류장 목록 (하루 캐시)."""
-  stations, page_size = [], None
+  stations, page_size = {}, None
   for page in range(1, 31):
     items = call_api(
         "BusSttnInfoInqireService",
@@ -241,12 +241,14 @@ def all_stations(city_code):
         numOfRows=1000,
         pageNo=page,
     )
-    stations.extend(items)
+    before = len(stations)
+    for item in items:
+      stations.setdefault(item.get("nodeid"), item)
     # 서버가 한 페이지 최대 건수를 1000보다 작게 제한할 수도 있어 첫 페이지 크기를 기준으로 판단
     page_size = page_size or len(items)
-    if not items or len(items) < page_size:
+    if not items or len(items) < page_size or len(stations) == before:
       break
-  return stations
+  return list(stations.values())
 
 
 def _norm(text):

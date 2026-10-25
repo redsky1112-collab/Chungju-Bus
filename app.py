@@ -74,17 +74,17 @@ with tab1:
     else:
       with st.spinner("출발 정류소의 실시간 버스 번호 조회 중..."):
         try:
-          # 1단계: 정류소 이름으로 정류소 ID(nodeid) 검색
-          sttn_url = "https://apis.data.go.kr/1613000/BusSttnInfoInqireService/getSttnNoList"
-          sttn_params = {
-              "serviceKey": current_key,
-              "cityCode": city_code_t1,
-              "nodeNm": start_station,
-              "numOfRows": "10",
-              "pageNo": "1",
-              "_type": "json",
-          }
-          res = requests.get(sttn_url, params=sttn_params, timeout=5)
+          import urllib.parse
+
+          encoded_node_nm = urllib.parse.quote(start_station)
+
+          # URL에 인증키를 직접 결합하여 인코딩 변형 차단
+          sttn_url = (
+              "https://apis.data.go.kr/1613000/BusSttnInfoInqireService/getSttnNoList"
+              f"?serviceKey={current_key}&cityCode={city_code_t1}&nodeNm={encoded_node_nm}&numOfRows=10&pageNo=1&_type=json"
+          )
+
+          res = requests.get(sttn_url, timeout=5)
 
           if res.status_code == 200:
             try:
@@ -115,17 +115,12 @@ with tab1:
                 )
                 chosen_node_id = station_options[chosen_label]
 
-                # 2단계: 실시간 도착 정보 조회
-                arvl_url = "https://apis.data.go.kr/1613000/ArvlInfoInqireService/getSttnAcctoArvlPregeInfoList"
-                arvl_params = {
-                    "serviceKey": current_key,
-                    "cityCode": city_code_t1,
-                    "nodeId": chosen_node_id,
-                    "numOfRows": "20",
-                    "pageNo": "1",
-                    "_type": "json",
-                }
-                arvl_res = requests.get(arvl_url, params=arvl_params, timeout=5)
+                # 도착 정보 조회 URL 직접 결합
+                arvl_url = (
+                    "https://apis.data.go.kr/1613000/ArvlInfoInqireService/getSttnAcctoArvlPregeInfoList"
+                    f"?serviceKey={current_key}&cityCode={city_code_t1}&nodeId={chosen_node_id}&numOfRows=20&pageNo=1&_type=json"
+                )
+                arvl_res = requests.get(arvl_url, timeout=5)
 
                 if arvl_res.status_code == 200:
                   a_data = arvl_res.json()
@@ -213,16 +208,14 @@ with tab2:
     else:
       with st.spinner("실시간 도착 정보 조회 중..."):
         try:
-          sttn_url = "https://apis.data.go.kr/1613000/BusSttnInfoInqireService/getSttnNoList"
-          sttn_params = {
-              "serviceKey": current_key,
-              "cityCode": city_code,
-              "nodeNm": station_query,
-              "numOfRows": "10",
-              "pageNo": "1",
-              "_type": "json",
-          }
-          res = requests.get(sttn_url, params=sttn_params, timeout=5)
+          import urllib.parse
+
+          encoded_q = urllib.parse.quote(station_query)
+          sttn_url = (
+              "https://apis.data.go.kr/1613000/BusSttnInfoInqireService/getSttnNoList"
+              f"?serviceKey={current_key}&cityCode={city_code}&nodeNm={encoded_q}&numOfRows=10&pageNo=1&_type=json"
+          )
+          res = requests.get(sttn_url, timeout=5)
 
           if res.status_code == 200:
             data = res.json()
@@ -236,16 +229,11 @@ with tab2:
               st.success(f"'{station_query}' 정류소 검색 성공!")
               chosen_node = items[0].get("nodeid")
 
-              arvl_url = "https://apis.data.go.kr/1613000/ArvlInfoInqireService/getSttnAcctoArvlPregeInfoList"
-              arvl_params = {
-                  "serviceKey": current_key,
-                  "cityCode": city_code,
-                  "nodeId": chosen_node,
-                  "numOfRows": "20",
-                  "pageNo": "1",
-                  "_type": "json",
-              }
-              arvl_res = requests.get(arvl_url, params=arvl_params, timeout=5)
+              arvl_url = (
+                  "https://apis.data.go.kr/1613000/ArvlInfoInqireService/getSttnAcctoArvlPregeInfoList"
+                  f"?serviceKey={current_key}&cityCode={city_code}&nodeId={chosen_node}&numOfRows=20&pageNo=1&_type=json"
+              )
+              arvl_res = requests.get(arvl_url, timeout=5)
 
               if arvl_res.status_code == 200:
                 a_data = arvl_res.json()

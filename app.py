@@ -15,15 +15,7 @@ st.set_page_config(
 st.title("🚌 스마트 대중교통 경로 & 실시간 안내판")
 st.caption("💡 실시간 정류소 및 버스 번호 안내 서비스 (카카오맵 연동)")
 
-# API 키는 st.secrets("DATA_GO_KR_KEY")에 넣어 두는 것을 권장합니다.
-# (.streamlit/secrets.toml 또는 Streamlit Cloud > Settings > Secrets)
-_FALLBACK_API_KEY = (
-    "9dee46a7fb260691759bcc48c371d7c750807ac380b0555594a696840e11bafe"
-)
-try:
-  API_KEY = st.secrets.get("DATA_GO_KR_KEY", _FALLBACK_API_KEY)
-except Exception:
-  API_KEY = _FALLBACK_API_KEY
+API_KEY = "9dee46a7fb260691759bcc48c371d7c750807ac380b0555594a696840e11bafe"
 
 BASE_URL = "apis.data.go.kr/1613000"
 TIMEOUT = 15

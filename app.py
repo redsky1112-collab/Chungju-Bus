@@ -1,9 +1,11 @@
 import difflib
 import math
 import urllib.parse
+from collections import Counter
 import xml.etree.ElementTree as ET
 
 import pandas as pd
+import pydeck as pdk
 import requests
 import streamlit as st
 from streamlit_js_eval import get_geolocation
@@ -170,6 +172,19 @@ def get_bus_locations(city_code, route_id):
   )
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_route_stops(city_code, route_id):
+  stops = call_api(
+      "BusRouteInfoInqireService",
+      "getRouteAcctoThrghSttnList",
+      cityCode=city_code,
+      routeId=route_id,
+      numOfRows=500,
+      pageNo=1,
+  )
+  return sorted(stops, key=lambda x: _to_int(x.get("nodeord")))
+
+
 def _to_int(value):
   try:
     return int(value)
@@ -290,8 +305,8 @@ def pick_station_by_name(city_code, query, key):
   return _pick(stations, key, lambda s: f"{s['nodenm']} (ARS: {s['nodeno']})")
 
 
-def pick_station_by_gps(key):
-  if st.button("📍 현재 위치로 가까운 정류장 찾기", width="stretch", key=f"{key}_btn"):
+def pick_station_by_gps(key, trigger):
+  if trigger:
     st.session_state[f"{key}_nonce"] = st.session_state.get(f"{key}_nonce", 0) + 1
     st.session_state.pop(f"{key}_coords", None)
 
@@ -332,6 +347,7 @@ def pick_station_by_gps(key):
   for s in items:
     station = _station(s, "")
     station["dist"] = distance_m(lat, lon, station["lat"], station["lon"])
+    station["me"] = (lat, lon)
     stations.append(station)
   stations.sort(key=lambda s: s["dist"] if s["dist"] is not None else 1e9)
   st.success(f"📍 현재 위치 근처 정류장 {len(stations)}개 (가까운 순)")
@@ -342,34 +358,91 @@ def pick_station_by_gps(key):
   )
 
 
+ROUTE_API_HINT = (
+    "정류장 방향과 '곧 도착할 버스' 표시는 공공데이터포털에서"
+    " 「국토교통부_(TAGO)_버스노선정보」를 추가로 활용신청하면 나타납니다."
+)
+
+
+def route_context(station, route_id):
+  """노선 경유 정류장 목록에서 이 정류장의 순번과 다음 정류장을 찾는다."""
+  stops = get_route_stops(station["citycode"], route_id)
+  for i, stop in enumerate(stops):
+    if stop.get("nodeid") == station["nodeid"]:
+      nxt = stops[i + 1].get("nodenm") if i + 1 < len(stops) else "종점"
+      return {"ord": _to_int(stop.get("nodeord")), "next": nxt, "stops": stops}
+  return None
+
+
+def route_contexts(station, arrivals):
+  """도착 예정 노선별 진행 방향 정보. 노선정보 API 미신청 시 빈 dict."""
+  contexts = {}
+  for route_id in dict.fromkeys(a.get("routeid") for a in arrivals):
+    try:
+      ctx = route_context(station, route_id)
+    except ApiError as e:
+      if "코드 30" in str(e):
+        st.info(ROUTE_API_HINT)
+        return {}
+      continue
+    if ctx:
+      contexts[route_id] = ctx
+  return contexts
+
+
+def show_direction(contexts):
+  nexts = [c["next"] for c in contexts.values() if c["next"] != "종점"]
+  if not nexts:
+    return
+  main_next = Counter(nexts).most_common(1)[0][0]
+  st.info(
+      f"🧭 이 승강장은 **{main_next}** 방향입니다 (다음 정류장 기준)."
+      " 반대 방향이면 위에서 같은 이름의 다른 승강장을 선택하세요."
+  )
+
+
 def show_arrivals(station):
   try:
     with st.spinner("실시간 도착 정보 조회 중..."):
       a_items = get_arrivals(station["citycode"], station["nodeid"])
   except ApiError as e:
     st.error(str(e))
-    return []
+    return [], {}
 
   if not a_items:
     st.info("현재 해당 정류소에 도착 예정인 버스가 없습니다.")
-    return []
+    return [], {}
+
+  with st.spinner("진행 방향 확인 중..."):
+    contexts = route_contexts(station, a_items)
+  show_direction(contexts)
 
   a_items.sort(key=lambda x: _to_int(x.get("arrtime")))
   rows = []
   for item in a_items:
     sec = _to_int(item.get("arrtime"))
-    rows.append({
+    row = {
         "버스번호": item.get("routeno"),
         "남은 시간": f"약 {sec // 60}분 ({sec}초 후)",
         "남은 정류장": f"{item.get('arrprevstationcnt', '-')}개 전",
-        "차량 유형": item.get("vehicletp", "일반"),
-    })
+    }
+    if contexts:
+      ctx = contexts.get(item.get("routeid"))
+      row["다음 정류장(방향)"] = ctx["next"] if ctx else "-"
+    row["차량 유형"] = item.get("vehicletp", "일반")
+    rows.append(row)
   st.markdown(f"### 🚍 [{station['nodenm']}] 실시간 버스 도착 정보")
   st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
-  return a_items
+  return a_items, contexts
 
 
-def show_bus_location(station, arrivals, key):
+COLOR_STATION = [255, 75, 75]   # 빨강
+COLOR_NEXT_BUS = [255, 164, 33]  # 주황
+COLOR_BUS = [28, 131, 225]  # 파랑
+COLOR_ME = [33, 195, 84]  # 초록
+
+
+def show_bus_location(station, arrivals, contexts, key):
   st.markdown("### 🗺️ 버스 위치 보기")
   options = {}
   for item in arrivals:
@@ -378,6 +451,7 @@ def show_bus_location(station, arrivals, key):
     options.setdefault(label, item)
   label = st.selectbox("위치를 볼 버스를 선택하세요", list(options.keys()), key=key)
   item = options[label]
+  routeno = item.get("routeno")
 
   try:
     with st.spinner("버스 위치 조회 중..."):
@@ -392,12 +466,25 @@ def show_bus_location(station, arrivals, key):
     return
 
   if not buses:
-    st.info(f"{item.get('routeno')}번 버스의 현재 운행 위치 정보가 없습니다.")
+    st.info(f"{routeno}번 버스의 현재 운행 위치 정보가 없습니다.")
     return
 
+  # 내 정류장보다 앞(순번이 작거나 같은) 버스 중 가장 가까운 차량 = 곧 도착할 버스
+  ctx = contexts.get(item.get("routeid"))
+  ord_by_node = {}
+  if ctx:
+    ord_by_node = {s.get("nodeid"): _to_int(s.get("nodeord")) for s in ctx["stops"]}
+  next_bus = None
+  if ctx:
+    best = -1
+    for b in buses:
+      b_ord = _to_int(b.get("nodeord")) or ord_by_node.get(b.get("nodeid"), 0)
+      b["_ord"] = b_ord
+      if b_ord <= ctx["ord"] and b_ord > best:
+        best, next_bus = b_ord, b
+
   st.caption(
-      f"가장 먼저 오는 {item.get('routeno')}번은 약"
-      f" {_to_int(item.get('arrtime')) // 60}분 후,"
+      f"가장 먼저 오는 {routeno}번은 약 {_to_int(item.get('arrtime')) // 60}분 후,"
       f" {item.get('arrprevstationcnt', '-')}개 전 정류장에 있습니다."
   )
 
@@ -405,31 +492,91 @@ def show_bus_location(station, arrivals, key):
   for b in buses:
     lat, lon = _to_float(b.get("gpslati")), _to_float(b.get("gpslong"))
     dist = distance_m(lat, lon, station["lat"], station["lon"])
+    is_next = b is next_bus
+    if ctx and "_ord" in b:
+      status = (
+          "🟠 곧 도착" if is_next
+          else ("오는 중" if b["_ord"] <= ctx["ord"] else "지나감")
+      )
+    else:
+      status = "-"
     rows.append({
+        "상태": status,
         "차량번호": b.get("vehicleno"),
         "현재 위치(정류장)": b.get("nodenm"),
         "내 정류장까지 직선거리": _fmt_dist(dist),
-        "_dist": dist if dist is not None else 1e9,
+        "_sort": (
+            ["🟠 곧 도착", "오는 중", "-", "지나감"].index(status),
+            dist if dist is not None else 1e9,
+        ),
     })
     if lat and lon:
-      points.append({"lat": lat, "lon": lon, "color": "#1f77b4", "size": 40})
+      points.append({
+          "lat": lat,
+          "lon": lon,
+          "color": COLOR_NEXT_BUS if is_next else COLOR_BUS,
+          "radius": 12 if is_next else 9,
+          "label": f"{'🟠 곧 도착 ' if is_next else '🔵 '}{routeno}번 {b.get('vehicleno', '')}"
+                   f" · {b.get('nodenm', '')}",
+      })
 
-  df = pd.DataFrame(rows).sort_values("_dist").drop(columns="_dist")
+  df = pd.DataFrame(rows).sort_values("_sort").drop(columns="_sort")
+  if not ctx:
+    df = df.drop(columns="상태")
   st.dataframe(df, width="stretch", hide_index=True)
 
   if station["lat"] and station["lon"]:
-    points.append(
-        {"lat": station["lat"], "lon": station["lon"], "color": "#e45756", "size": 60}
-    )
-  if points:
-    st.map(
-        pd.DataFrame(points),
-        latitude="lat",
-        longitude="lon",
-        color="color",
-        size="size",
-    )
-    st.caption("🔴 내 정류장 · 🔵 운행 중인 버스")
+    points.append({
+        "lat": station["lat"],
+        "lon": station["lon"],
+        "color": COLOR_STATION,
+        "radius": 14,
+        "label": f"🔴 출발 정류장 · {station['nodenm']}",
+    })
+  if station.get("me"):
+    points.append({
+        "lat": station["me"][0],
+        "lon": station["me"][1],
+        "color": COLOR_ME,
+        "radius": 8,
+        "label": "🟢 내 현재 위치",
+    })
+  if not points:
+    return
+
+  legend = ["🔴 **출발 정류장**", "🔵 **운행 중인 버스**"]
+  if next_bus is not None:
+    legend.insert(1, "🟠 **곧 도착할 버스**")
+  if station.get("me"):
+    legend.append("🟢 **내 현재 위치**")
+  st.markdown("지도 표시: " + " · ".join(legend))
+
+  pts = pd.DataFrame(points)
+  center_lat = station["lat"] or pts["lat"].mean()
+  center_lon = station["lon"] or pts["lon"].mean()
+  st.pydeck_chart(
+      pdk.Deck(
+          layers=[
+              pdk.Layer(
+                  "ScatterplotLayer",
+                  data=pts,
+                  get_position="[lon, lat]",
+                  get_fill_color="color",
+                  get_radius="radius",
+                  radius_units="pixels",
+                  stroked=True,
+                  get_line_color=[255, 255, 255],
+                  line_width_min_pixels=2,
+                  pickable=True,
+              )
+          ],
+          initial_view_state=pdk.ViewState(
+              latitude=center_lat, longitude=center_lon, zoom=13
+          ),
+          tooltip={"text": "{label}"},
+      )
+  )
+  st.caption("점을 누르면 무엇인지 표시됩니다.")
 
 
 city_dict, city_err = get_city_list()
@@ -450,54 +597,59 @@ tab1, tab2 = st.tabs(["🧭 출발 정류소 맞춤 버스 조회", "⏱️ 일�
 with tab1:
   st.subheader("🧭 출발 정류소 실시간 버스 번호 찾기")
   st.write(
-      "**현재 위치 근처 정류장**을 찾거나 **정류소 이름**(일부만 입력해도 됨)으로"
-      " 검색해, 경유하는 실시간 버스와 버스 위치를 확인할 수 있습니다."
+      "**출발지**에 정류장 이름(일부만 입력해도 됨)이나 ARS 번호를 입력하거나,"
+      " **내 위치**로 가까운 정류장을 찾으세요."
   )
 
-  mode = st.radio(
-      "출발 정류소 찾는 방법",
-      ["📍 내 위치 근처", "🔎 이름으로 검색"],
-      horizontal=True,
-      key="mode_t1",
+  selected_city_t1 = st.selectbox(
+      "지역 선택 (이름 검색용)",
+      list(city_dict.keys()),
+      index=default_idx,
+      key="city_t1",
   )
+  start_station = st.text_input(
+      "출발지",
+      value="",
+      placeholder="예: 오송역, 롯데아울렛, 3223",
+      key="start_stn",
+  )
+  destination = st.text_input(
+      "도착지 (카카오맵 경로용)",
+      value="청주롯데아울렛",
+      placeholder="예: 청주롯데아울렛, 청주시청",
+      key="dest_stn",
+  )
+
+  col_search, col_gps = st.columns(2)
+  search_clicked = col_search.button(
+      "🔎 출발지로 검색", width="stretch", key="btn_t1"
+  )
+  gps_clicked = col_gps.button(
+      "📍 내 위치로 찾기", width="stretch", key="gps_t1_btn"
+  )
+
+  if search_clicked:
+    if start_station.strip():
+      st.session_state["src_t1"] = (
+          "name",
+          city_dict[selected_city_t1],
+          start_station.strip(),
+      )
+    else:
+      st.warning("출발지를 입력하거나 '📍 내 위치로 찾기'를 눌러 주세요.")
+      st.session_state.pop("src_t1", None)
+  if gps_clicked:
+    st.session_state["src_t1"] = ("gps",)
 
   station = None
-  if mode == "📍 내 위치 근처":
-    station = pick_station_by_gps("gps_t1")
-  else:
-    selected_city_t1 = st.selectbox(
-        "지역 선택 (출발지)",
-        list(city_dict.keys()),
-        index=default_idx,
-        key="city_t1",
-    )
-    start_station = st.text_input(
-        "출발 정류소 이름 또는 ARS 번호",
-        value="오송대광로제비앙",
-        placeholder="예: 오송역, 롯데아울렛, 3223",
-        key="start_stn",
-    )
-    if st.button("🔎 정류소 검색", width="stretch", key="btn_t1"):
-      if start_station.strip():
-        st.session_state["search_t1"] = (
-            city_dict[selected_city_t1],
-            start_station.strip(),
-        )
-      else:
-        st.warning("출발 정류소 이름을 입력해 주세요.")
-        st.session_state.pop("search_t1", None)
-    if "search_t1" in st.session_state:
-      s_city, s_name = st.session_state["search_t1"]
-      station = pick_station_by_name(s_city, s_name, key="pick_t1")
+  src = st.session_state.get("src_t1")
+  if src and src[0] == "gps":
+    station = pick_station_by_gps("gps_t1", trigger=gps_clicked)
+  elif src:
+    station = pick_station_by_name(src[1], src[2], key="pick_t1")
 
   if station:
-    destination = st.text_input(
-        "도착지 (카카오맵 경로용)",
-        value="청주롯데아울렛",
-        placeholder="예: 청주롯데아울렛, 청주시청",
-        key="dest_stn",
-    )
-    arrivals = show_arrivals(station)
+    arrivals, contexts = show_arrivals(station)
     if arrivals:
       kakao_map_url = "https://map.kakao.com/?" + urllib.parse.urlencode(
           {"sName": station["nodenm"], "eName": destination}
@@ -507,7 +659,7 @@ with tab1:
           kakao_map_url,
           width="stretch",
       )
-      show_bus_location(station, arrivals, key="bus_t1")
+      show_bus_location(station, arrivals, contexts, key="bus_t1")
     if st.button("🔄 새로고침", key="refresh_t1"):
       st.rerun()
 
@@ -537,8 +689,8 @@ with tab2:
     s_city, s_name = st.session_state["search_t2"]
     station2 = pick_station_by_name(s_city, s_name, key="pick_t2")
     if station2:
-      arrivals2 = show_arrivals(station2)
+      arrivals2, contexts2 = show_arrivals(station2)
       if arrivals2:
-        show_bus_location(station2, arrivals2, key="bus_t2")
+        show_bus_location(station2, arrivals2, contexts2, key="bus_t2")
       if st.button("🔄 새로고침", key="refresh_t2"):
         st.rerun()

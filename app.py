@@ -323,9 +323,8 @@ def _station(s, city_code, dist=None):
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def station_direction(city_code, node_id):
-  """정류장을 지나는 노선들의 다음 정류장 중 가장 많은 것을 방향으로 본다."""
-  routes = call_api(
+def station_routes(city_code, node_id):
+  return call_api(
       "BusSttnInfoInqireService",
       "getSttnThrghRouteList",
       cityCode=city_code,
@@ -333,6 +332,12 @@ def station_direction(city_code, node_id):
       numOfRows=100,
       pageNo=1,
   )
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def station_direction(city_code, node_id):
+  """정류장을 지나는 노선들의 다음 정류장 중 가장 많은 것을 방향으로 본다."""
+  routes = station_routes(city_code, node_id)
   nexts = []
   for route in routes[:3]:
     stops = get_route_stops(city_code, route.get("routeid"))
@@ -541,14 +546,20 @@ MARKER_COLORS = {
 MARKER_PIXELS = {"station": 11, "next": 10, "bus": 8, "me": 7}
 
 
-def show_bus_location(station, arrivals, contexts, key):
+def show_bus_location(station, arrivals, contexts, key, preferred_route=None):
   st.markdown("### 🗺️ 버스 위치 보기")
   options = {}
+  # 경로 안내에서 고른 버스를 맨 앞에
+  arrivals = sorted(arrivals, key=lambda a: a.get("routeid") != preferred_route)
   for item in arrivals:
     sec = _to_int(item.get("arrtime"))
     label = f"{item.get('routeno')}번 · 약 {sec // 60}분 후 도착"
     options.setdefault(label, item)
-  label = st.selectbox("위치를 볼 버스를 선택하세요", list(options.keys()), key=key)
+  label = st.selectbox(
+      "위치를 볼 버스를 선택하세요",
+      list(options.keys()),
+      key=f"{key}_{preferred_route}",
+  )
   item = options[label]
   routeno = item.get("routeno")
 
@@ -744,38 +755,408 @@ def naver_route_url(station, place):
   return None
 
 
-def show_naver_route(station, destination):
+def pick_destination(station, destination):
+  """도착지 이름을 좌표로 바꾼다. 못 찾으면 네이버지도 웹 검색 버튼만 보여준다."""
   dest = destination.strip()
   if not dest:
-    st.caption("도착지를 입력하면 네이버지도 대중교통 길찾기를 바로 열 수 있습니다.")
-    return
+    st.caption("도착지를 입력하면 경로 안내와 네이버지도 길찾기를 볼 수 있습니다.")
+    return None
 
-  web_search = "https://map.naver.com/p/search/" + urllib.parse.quote(dest)
   places = geocode(dest) if station["lat"] and station["lon"] else []
   if not places:
     st.link_button(
-        f"🗺️ 네이버지도에서 '{dest}' 찾기", web_search, width="stretch"
+        f"🗺️ 네이버지도에서 '{dest}' 찾기",
+        "https://map.naver.com/p/search/" + urllib.parse.quote(dest),
+        width="stretch",
     )
-    return
+    return None
 
-  place = places[0]
-  if len(places) > 1:
-    options = {f"{p['name']} · {p['addr']}": p for p in places}
-    place = options[
-        st.selectbox("도착지를 선택하세요", list(options.keys()), key="dest_pick")
-    ]
+  if len(places) == 1:
+    return places[0]
+  options = {f"{p['name']} · {p['addr']}": p for p in places}
+  return options[
+      st.selectbox("도착지를 선택하세요", list(options.keys()), key="dest_pick")
+  ]
 
+
+def show_naver_buttons(station, place):
   url = naver_route_url(station, place)
   if url:
     st.link_button(
         f"🧭 네이버지도로 길찾기: {station['nodenm']} → {place['name']}",
         url,
-        type="primary",
         width="stretch",
     )
-    st.caption("네이버지도 앱이 열리지 않으면 아래 버튼으로 웹에서 찾아보세요.")
   st.link_button(
-      f"🗺️ 네이버지도 웹에서 '{dest}' 찾기", web_search, width="stretch"
+      f"🗺️ 네이버지도 웹에서 '{place['name']}' 찾기",
+      "https://map.naver.com/p/search/" + urllib.parse.quote(place["name"]),
+      width="stretch",
+  )
+
+
+# ------------------------------------------
+# 시내버스 경로 계산 (직행 + 1회 환승)
+# ------------------------------------------
+MAX_WALK_M = 800  # 하차 후 도착지까지 최대 도보
+TRANSFER_WALK_M = 200  # 환승 시 최대 도보
+SIBLING_STOP_M = 200  # 함께 고려할 근처 승강장 범위
+MAX_RIDE_STOPS = 70
+MIN_PER_STOP = 1.5
+WALK_M_PER_MIN = 70
+TRANSFER_PENALTY_MIN = 8
+
+
+def _fetch_all(fn, args_list):
+  """API 함수를 병렬 호출한다. 실패한 호출은 None."""
+
+  def safe(args):
+    try:
+      return fn(*args)
+    except ApiError:
+      return None
+
+  with ThreadPoolExecutor(max_workers=8) as pool:
+    return list(pool.map(safe, args_list))
+
+
+def _pt(stop):
+  return _to_float(stop.get("gpslati")), _to_float(stop.get("gpslong"))
+
+
+def _dist(a, b):
+  d = distance_m(a[0], a[1], b[0], b[1])
+  return 1e9 if d is None else d
+
+
+def _routes_through(stations):
+  """정류장들을 지나는 노선과 노선별 정류장 목록. {(city, routeid): (route, stops)}"""
+  route_lists = _fetch_all(
+      station_routes, [(s["citycode"], s["nodeid"]) for s in stations]
+  )
+  routes = {}
+  for s, rs in zip(stations, route_lists):
+    for r in rs or []:
+      routes.setdefault((s["citycode"], r.get("routeid")), r)
+  keys = list(routes)
+  stop_lists = _fetch_all(get_route_stops, keys)
+  return {
+      k: (routes[k], stops) for k, stops in zip(keys, stop_lists) if stops
+  }
+
+
+def _nearby(lat, lon, limit):
+  try:
+    items = nearby_stations(round(lat, 4), round(lon, 4))
+  except ApiError:
+    return []
+  stations = [_station(s, "") for s in items]
+  stations = [s for s in stations if s["lat"] and s["citycode"]]
+  stations.sort(key=lambda s: distance_m(lat, lon, s["lat"], s["lon"]))
+  return stations[:limit]
+
+
+def _leg(route, stops, i, j, city):
+  return {
+      "routeno": route.get("routeno"),
+      "routeid": route.get("routeid"),
+      "city": city,
+      "stops": stops[i : j + 1],
+  }
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def plan_routes(start, place):
+  """출발 승강장 → 도착지 시내버스 경로 후보 (최대 3개)."""
+  dest = (place["lat"], place["lon"])
+
+  # 출발: 선택한 승강장 + 길 건너 등 근처 승강장
+  starts = [start] + [
+      s
+      for s in _nearby(start["lat"], start["lon"], 6)
+      if s["nodeid"] != start["nodeid"]
+      and distance_m(start["lat"], start["lon"], s["lat"], s["lon"]) <= SIBLING_STOP_M
+  ]
+  start_by_id = {s["nodeid"]: s for s in starts}
+  a_routes = _routes_through(starts)
+
+  # 도착지 근처 정류장을 지나는 노선 (환승용)
+  b_routes = _routes_through(_nearby(dest[0], dest[1], 6))
+
+  options = []
+
+  # 출발 노선별로 승차 지점과 앞으로 지날 정류장
+  a_legs = []
+  for (city, _), (route, stops) in a_routes.items():
+    for i, stop in enumerate(stops):
+      if stop.get("nodeid") in start_by_id:
+        a_legs.append((city, route, stops, i, start_by_id[stop.get("nodeid")]))
+        break
+
+  def walk_from_start(board):
+    return distance_m(start["lat"], start["lon"], board["lat"], board["lon"]) or 0
+
+  # 직행
+  for city, route, stops, i, board in a_legs:
+    ahead = range(i + 1, min(len(stops), i + 1 + MAX_RIDE_STOPS))
+    if not ahead:
+      continue
+    j = min(ahead, key=lambda j: _dist(_pt(stops[j]), dest))
+    walk_end = _dist(_pt(stops[j]), dest)
+    if walk_end > MAX_WALK_M:
+      continue
+    walk_start = walk_from_start(board)
+    cost = (j - i) * MIN_PER_STOP + (walk_end + walk_start) / WALK_M_PER_MIN
+    options.append({
+        "legs": [_leg(route, stops, i, j, city)],
+        "board": board,
+        "walk_start": walk_start,
+        "walk_transfer": 0,
+        "walk_end": walk_end,
+        "cost": cost,
+    })
+
+  # 1회 환승: 도착지 쪽 노선의 하차 지점과 그 이전 정류장 격자 색인
+  grid = {}
+  b_info = []
+  for (city, _), (route, stops) in b_routes.items():
+    k = min(range(len(stops)), key=lambda k: _dist(_pt(stops[k]), dest))
+    walk_end = _dist(_pt(stops[k]), dest)
+    if walk_end > MAX_WALK_M or k == 0:
+      continue
+    b_idx = len(b_info)
+    b_info.append((city, route, stops, k, walk_end))
+    for i2 in range(max(0, k - MAX_RIDE_STOPS), k):
+      lat, lon = _pt(stops[i2])
+      if lat is None:
+        continue
+      cell = (round(lat / 0.002), round(lon / 0.002))
+      grid.setdefault(cell, []).append((b_idx, i2))
+
+  best_transfer = {}
+  for city, route, stops, i, board in a_legs:
+    walk_start = walk_from_start(board)
+    for j in range(i + 1, min(len(stops), i + 1 + MAX_RIDE_STOPS)):
+      lat, lon = _pt(stops[j])
+      if lat is None:
+        continue
+      cy, cx = round(lat / 0.002), round(lon / 0.002)
+      for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+          for b_idx, i2 in grid.get((cy + dy, cx + dx), []):
+            b_city, b_route, b_stops, k, walk_end = b_info[b_idx]
+            # 두 번째 버스를 출발지에서 바로 탈 수 있으면 환승할 이유가 없다
+            if (b_city, b_route.get("routeid")) in a_routes:
+              continue
+            walk_tr = _dist((lat, lon), _pt(b_stops[i2]))
+            if walk_tr > TRANSFER_WALK_M:
+              continue
+            cost = (
+                ((j - i) + (k - i2)) * MIN_PER_STOP
+                + (walk_start + walk_tr + walk_end) / WALK_M_PER_MIN
+                + TRANSFER_PENALTY_MIN
+            )
+            key = (route.get("routeid"), b_route.get("routeid"))
+            if key not in best_transfer or cost < best_transfer[key]["cost"]:
+              best_transfer[key] = {
+                  "legs": [
+                      _leg(route, stops, i, j, city),
+                      _leg(b_route, b_stops, i2, k, b_city),
+                  ],
+                  "board": board,
+                  "walk_start": walk_start,
+                  "walk_transfer": walk_tr,
+                  "walk_end": walk_end,
+                  "cost": cost,
+              }
+  options.extend(best_transfer.values())
+
+  # 첫 버스가 같은 후보는 가장 좋은 것만, 최대 3개
+  options.sort(key=lambda o: o["cost"])
+  picked, seen = [], set()
+  for o in options:
+    sig = tuple(leg["routeno"] for leg in o["legs"])
+    if sig in seen:
+      continue
+    seen.add(sig)
+    picked.append(o)
+    if len(picked) == 3:
+      break
+  return picked
+
+
+def _stop_label(stop):
+  no = stop.get("nodeno")
+  return f"{stop.get('nodenm')}" + (f" (ARS {no})" if no else "")
+
+
+def _fmt_walk(m):
+  return f"약 {int(round(m / 10) * 10)}m (도보 {max(1, round(m / WALK_M_PER_MIN))}분)"
+
+
+def _option_title(o):
+  buses = " → ".join(f"{leg['routeno']}번" for leg in o["legs"])
+  kind = "직행" if len(o["legs"]) == 1 else "1회 환승"
+  n = sum(len(leg["stops"]) - 1 for leg in o["legs"])
+  return f"{buses} ({kind}) · {n}개 정류장 · 약 {round(o['cost'])}분"
+
+
+ROUTE_COLORS = {
+    "board": [20, 170, 60],  # 초록: 승차
+    "transfer": [255, 140, 0],  # 주황: 환승
+    "alight": [230, 30, 30],  # 빨강: 하차
+    "dest": [130, 60, 200],  # 보라: 도착지
+}
+LEG_COLORS = [[20, 100, 230], [0, 170, 170]]  # 1번째 버스 파랑, 2번째 버스 청록
+
+
+def show_route_guide(station, place, arrivals):
+  """출발 승강장 → 도착지 시내버스 경로 안내. 선택한 경로의 첫 노선 id를 돌려준다."""
+  st.markdown(f"### 🚏 경로 안내: {station['nodenm']} → {place['name']}")
+  if not (station["lat"] and station["lon"]):
+    st.info("이 정류장의 위치 정보가 없어 경로를 계산할 수 없습니다.")
+    return None
+
+  with st.spinner("시내버스 경로 찾는 중... (처음에는 10초 정도 걸릴 수 있어요)"):
+    try:
+      options = plan_routes(station, place)
+    except Exception as e:  # 경로 계산 실패가 화면 전체를 멈추지 않도록
+      st.warning(f"경로를 계산하지 못했습니다: {e}")
+      return None
+
+  if not options:
+    st.info(
+        "시내버스로 갈 수 있는 경로(직행 또는 1회 환승)를 찾지 못했습니다."
+        " 다른 지역이나 먼 곳이라면 아래 네이버지도 길찾기를 이용하세요."
+    )
+    return None
+
+  titles = [f"{n}. {_option_title(o)}" for n, o in enumerate(options, 1)]
+  choice = st.radio("경로 선택", titles, key="route_choice")
+  o = options[titles.index(choice)]
+
+  arrival_by_route = {}
+  for a in arrivals:
+    arrival_by_route.setdefault(a.get("routeid"), a)
+
+  steps = []
+  board = o["board"]
+  first = o["legs"][0]
+  if board["nodeid"] != station["nodeid"]:
+    steps.append(
+        f"🚶 근처 **{board['nodenm']}** 승강장(ARS {board['nodeno']})으로 이동하세요"
+        f" — {_fmt_walk(o['walk_start'])}"
+    )
+
+  for n, leg in enumerate(o["legs"]):
+    on, off = leg["stops"][0], leg["stops"][-1]
+    rides = len(leg["stops"]) - 1
+    toward = leg["stops"][1].get("nodenm") if rides >= 1 else ""
+    if n == 0:
+      wait = ""
+      a = arrival_by_route.get(leg["routeid"]) if board["nodeid"] == station["nodeid"] else None
+      if a:
+        wait = f" — ⏱ 약 {_to_int(a.get('arrtime')) // 60}분 후 도착"
+      steps.append(
+          f"🟢 **{_stop_label(on)}**에서 **{leg['routeno']}번** 승차"
+          f" ({toward} 방향){wait}"
+      )
+    else:
+      prev_off = o["legs"][n - 1]["stops"][-1]
+      if prev_off.get("nodeid") == on.get("nodeid"):
+        where = "같은 정류장에서"
+      else:
+        where = f"{_fmt_walk(o['walk_transfer'])} 걸어서 **{_stop_label(on)}**에서"
+      steps.append(
+          f"🟠 **환승**: {where} **{leg['routeno']}번** 승차 ({toward} 방향)"
+      )
+    before = leg["stops"][-2].get("nodenm") if rides >= 2 else None
+    bell = f" — 🔔 '{before}' 지나면 하차벨" if before else ""
+    icon = "🔴" if n == len(o["legs"]) - 1 else "🟠"
+    steps.append(
+        f"🚌 {rides}개 정류장 이동 → {icon} **{_stop_label(off)}** 하차{bell}"
+    )
+  steps.append(
+      f"🏁 **{place['name']}**까지 걸어서 {_fmt_walk(o['walk_end'])}"
+  )
+  st.markdown("\n".join(f"{n}. {step}" for n, step in enumerate(steps, 1)))
+
+  for leg in o["legs"]:
+    with st.expander(f"🚌 {leg['routeno']}번 지나는 정류장 보기 ({len(leg['stops']) - 1}개)"):
+      names = [s.get("nodenm") for s in leg["stops"]]
+      st.markdown(
+          "\n".join(
+              f"- {'**' + nm + '** (승차)' if i == 0 else '**' + nm + '** (하차)' if i == len(names) - 1 else nm}"
+              for i, nm in enumerate(names)
+          )
+      )
+
+  show_route_map(o, place)
+  return first["routeid"] if board["nodeid"] == station["nodeid"] else None
+
+
+def show_route_map(o, place):
+  layers, points = [], []
+  for n, leg in enumerate(o["legs"]):
+    path = [[p[1], p[0]] for p in map(_pt, leg["stops"]) if p[0] is not None]
+    if len(path) >= 2:
+      layers.append(
+          pdk.Layer(
+              "PathLayer",
+              data=[{"path": path, "label": f"{leg['routeno']}번"}],
+              get_path="path",
+              get_color=LEG_COLORS[n % 2],
+              width_min_pixels=5,
+              pickable=True,
+          )
+      )
+    on, off = leg["stops"][0], leg["stops"][-1]
+    last = n == len(o["legs"]) - 1
+    for stop, kind, text in (
+        (on, "board" if n == 0 else "transfer", f"{leg['routeno']}번 승차"),
+        (off, "alight" if last else "transfer", f"{leg['routeno']}번 하차"),
+    ):
+      lat, lon = _pt(stop)
+      if lat is not None:
+        points.append({
+            "lat": lat, "lon": lon, "kind": kind,
+            "label": f"{text} · {stop.get('nodenm')}",
+        })
+  points.append({
+      "lat": place["lat"], "lon": place["lon"], "kind": "dest",
+      "label": f"도착지 · {place['name']}",
+  })
+  pts = pd.DataFrame(points)
+  for kind in ("board", "transfer", "alight", "dest"):
+    group = pts[pts["kind"] == kind]
+    if group.empty:
+      continue
+    layers.append(
+        pdk.Layer(
+            "ScatterplotLayer",
+            data=group,
+            get_position=["lon", "lat"],
+            get_fill_color=ROUTE_COLORS[kind],
+            get_radius=40,
+            radius_min_pixels=9,
+            radius_max_pixels=15,
+            stroked=True,
+            get_line_color=[255, 255, 255],
+            line_width_min_pixels=2,
+            pickable=True,
+        )
+    )
+  legend = "🟢 **승차** · 🔴 **하차** · 🟣 **도착지** · 🟦 **버스 노선**"
+  if len(o["legs"]) > 1:
+    legend = "🟢 **승차** · 🟠 **환승** · 🔴 **하차** · 🟣 **도착지** · 🟦 **1번째 버스** · 🩵 **2번째 버스**"
+  st.markdown("경로 지도: " + legend)
+  st.pydeck_chart(
+      pdk.Deck(
+          layers=layers,
+          initial_view_state=pdk.ViewState(
+              latitude=pts["lat"].mean(), longitude=pts["lon"].mean(), zoom=12
+          ),
+          tooltip={"text": "{label}"},
+      )
   )
 
 
@@ -847,8 +1228,14 @@ elif src:
 
 if station:
   arrivals, contexts = show_arrivals(station)
-  show_naver_route(station, destination)
+  preferred = None
+  place = pick_destination(station, destination)
+  if place:
+    preferred = show_route_guide(station, place, arrivals)
+    show_naver_buttons(station, place)
   if arrivals:
-    show_bus_location(station, arrivals, contexts, key="bus_t1")
+    show_bus_location(
+        station, arrivals, contexts, key="bus_t1", preferred_route=preferred
+    )
   if st.button("🔄 새로고침", key="refresh_t1"):
     st.rerun()

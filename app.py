@@ -581,6 +581,11 @@ def show_bus_location(station, arrivals, contexts, key):
       b["_ord"] = b_ord
       if b_ord <= ctx["ord"] and b_ord > best:
         best, next_bus = b_ord, b
+    # 이미 지나간 버스는 가장 최근에 지나간 1대만 남긴다
+    passed = [b for b in buses if b["_ord"] > ctx["ord"]]
+    if passed:
+      last_passed = min(passed, key=lambda b: b["_ord"])
+      buses = [b for b in buses if b["_ord"] <= ctx["ord"] or b is last_passed]
 
   st.caption(
       f"가장 먼저 오는 {routeno}번은 약 {_to_int(item.get('arrtime')) // 60}분 후,"

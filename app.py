@@ -87,96 +87,103 @@ with tab1:
           res = requests.get(sttn_url, params=sttn_params, timeout=5)
 
           if res.status_code == 200:
-            data = res.json()
-            items = (
-                data.get("response", {})
-                .get("body", {})
-                .get("items", {})
-                .get("item", [])
-            )
-            if isinstance(items, dict):
-              items = [items]
-
-            if items:
-              st.success(
-                  f"📍 '{start_station}' 관련 정류소를 찾았습니다! (총"
-                  f" {len(items)}개소)"
+            try:
+              data = res.json()
+              body = data.get("response", {}).get("body", {})
+              items_container = body.get("items", {})
+              items = (
+                  items_container.get("item", []) if items_container else []
               )
+              if isinstance(items, dict):
+                items = [items]
 
-              # 검색된 정류소 선택 옵션 생성
-              station_options = {
-                  f"{s.get('nodenm')} (ARS: {s.get('nodeno', '-')})": s.get(
-                      "nodeid"
-                  )
-                  for s in items
-              }
-              chosen_label = st.selectbox(
-                  "조회할 정확한 승강장을 선택하세요", list(station_options.keys())
-              )
-              chosen_node_id = station_options[chosen_label]
-
-              # 2단계: 선택된 정류소의 실시간 도착 버스 정보 조회
-              arvl_url = "https://apis.data.go.kr/1613000/ArvlInfoInqireService/getSttnAcctoArvlPregeInfoList"
-              arvl_params = {
-                  "serviceKey": current_key,
-                  "cityCode": city_code_t1,
-                  "nodeId": chosen_node_id,
-                  "numOfRows": "20",
-                  "pageNo": "1",
-                  "_type": "json",
-              }
-              arvl_res = requests.get(arvl_url, params=arvl_params, timeout=5)
-
-              if arvl_res.status_code == 200:
-                a_data = arvl_res.json()
-                a_items = (
-                    a_data.get("response", {})
-                    .get("body", {})
-                    .get("items", {})
-                    .get("item", [])
+              if items:
+                st.success(
+                    f"📍 '{start_station}' 관련 정류소를 찾았습니다! (총"
+                    f" {len(items)}개소)"
                 )
-                if isinstance(a_items, dict):
-                  a_items = [a_items]
 
-                if a_items:
-                  st.markdown(
-                      f"### 🚍 [{chosen_label}] 경유 실시간 버스 도착 정보"
-                  )
-                  rows = []
-                  for item in a_items:
-                    sec = int(item.get("arrtime", 0))
-                    rows.append({
-                        "탑승 버스번호": item.get("routeno"),
-                        "남은 시간": f"약 {sec // 60}분 ({sec}초 후)",
-                        "남은 정류장": f"{item.get('arrprevstationcnt')}개 전",
-                        "차량 유형": item.get("vehicletp", "일반"),
-                    })
-                  st.dataframe(
-                      pd.DataFrame(rows), use_container_width=True
-                  )
+                station_options = {
+                    f"{s.get('nodenm')} (ARS: {s.get('nodeno', '-')})": s.get(
+                        "nodeid"
+                    )
+                    for s in items
+                }
+                chosen_label = st.selectbox(
+                    "조회할 정확한 승강장을 선택하세요",
+                    list(station_options.keys()),
+                )
+                chosen_node_id = station_options[chosen_label]
 
-                  # 카카오맵 연동 버튼
-                  kakao_map_url = f"https://map.kakao.com/?sName={start_station}&eName={destination}"
-                  st.link_button(
-                      "🗺️ 카카오맵에서 목적지까지 상세 경로(하차 정류장 포함) 보기",
-                      kakao_map_url,
-                      use_container_width=True,
+                # 2단계: 실시간 도착 정보 조회
+                arvl_url = "https://apis.data.go.kr/1613000/ArvlInfoInqireService/getSttnAcctoArvlPregeInfoList"
+                arvl_params = {
+                    "serviceKey": current_key,
+                    "cityCode": city_code_t1,
+                    "nodeId": chosen_node_id,
+                    "numOfRows": "20",
+                    "pageNo": "1",
+                    "_type": "json",
+                }
+                arvl_res = requests.get(arvl_url, params=arvl_params, timeout=5)
+
+                if arvl_res.status_code == 200:
+                  a_data = arvl_res.json()
+                  a_body = a_data.get("response", {}).get("body", {})
+                  a_items_container = a_body.get("items", {})
+                  a_items = (
+                      a_items_container.get("item", [])
+                      if a_items_container
+                      else []
                   )
+                  if isinstance(a_items, dict):
+                    a_items = [a_items]
+
+                  if a_items:
+                    st.markdown(
+                        f"### 🚍 [{chosen_label}] 경유 실시간 버스 도착 정보"
+                    )
+                    rows = []
+                    for item in a_items:
+                      sec = int(item.get("arrtime", 0))
+                      rows.append({
+                          "탑승 버스번호": item.get("routeno"),
+                          "남은 시간": f"약 {sec // 60}분 ({sec}초 후)",
+                          "남은 정류장": f"{item.get('arrprevstationcnt')}개 전",
+                          "차량 유형": item.get("vehicletp", "일반"),
+                      })
+                    st.dataframe(
+                        pd.DataFrame(rows), use_container_width=True
+                    )
+
+                    kakao_map_url = f"https://map.kakao.com/?sName={start_station}&eName={destination}"
+                    st.link_button(
+                        "🗺️ 카카오맵에서 목적지까지 상세 경로 보기",
+                        kakao_map_url,
+                        use_container_width=True,
+                    )
+                  else:
+                    st.info(
+                        "현재 해당 출발 정류소에 도착 예정인 버스 노선이 없습니다."
+                    )
                 else:
-                  st.info(
-                      "현재 해당 출발 정류소에 도착 예정인 버스 노선이 없습니다."
+                  st.error(
+                      f"도착 정보 통신 오류 (상태 코드: {arvl_res.status_code})"
                   )
+                  st.code(arvl_res.text)
               else:
-                st.error("실시간 도착 정보를 불러오지 못했습니다.")
-            else:
-              st.warning(
-                  f"'{start_station}'에 해당하는 정류소를 찾지 못했습니다."
-                  " 정류소 이름을 다시 확인해 주세요."
-              )
+                st.warning(
+                    f"'{start_station}'에 해당하는 정류소를 찾지 못했습니다."
+                    " 정류소 이름을 다르게(예: 오송역) 검색해 보세요."
+                )
+            except Exception as json_err:
+              st.error(f"데이터 파싱 오류: {json_err}")
+              st.code(res.text)
           else:
-            st.error("API 서버 통신에 실패했습니다.")
+            st.error(f"API 통신 오류 (상태 코드: {res.status_code})")
+            st.code(res.text)
         except Exception as e:
-          st.error(f"오류 발생: {e}")
+          st.error(f"시스템 오류 발생: {e}")
 
 # ==========================================
 # TAB 2: 일반 정류소별 실시간 버스 도착 예정 시간
@@ -219,12 +226,9 @@ with tab2:
 
           if res.status_code == 200:
             data = res.json()
-            items = (
-                data.get("response", {})
-                .get("body", {})
-                .get("items", {})
-                .get("item", [])
-            )
+            body = data.get("response", {}).get("body", {})
+            items_container = body.get("items", {})
+            items = items_container.get("item", []) if items_container else []
             if isinstance(items, dict):
               items = [items]
 
@@ -244,12 +248,13 @@ with tab2:
               arvl_res = requests.get(arvl_url, params=arvl_params, timeout=5)
 
               if arvl_res.status_code == 200:
+                a_data = arvl_res.json()
+                a_body = a_data.get("response", {}).get("body", {})
+                a_items_container = a_body.get("items", {})
                 a_items = (
-                    arvl_res.json()
-                    .get("response", {})
-                    .get("body", {})
-                    .get("items", {})
-                    .get("item", [])
+                    a_items_container.get("item", [])
+                    if a_items_container
+                    else []
                 )
                 if isinstance(a_items, dict):
                   a_items = [a_items]
@@ -267,7 +272,13 @@ with tab2:
                   st.dataframe(pd.DataFrame(rows), use_container_width=True)
                 else:
                   st.info("현재 도착 예정인 버스가 없습니다.")
+              else:
+                st.error(f"도착 정보 통신 오류 ({arvl_res.status_code})")
+                st.code(arvl_res.text)
+            else:
+              st.warning(f"'{station_query}' 정류소를 찾지 못했습니다.")
           else:
-            st.error("API 서버 응답 대기 중입니다.")
+            st.error(f"API 통신 오류 ({res.status_code})")
+            st.code(res.text)
         except Exception as e:
           st.error(f"오류 발생: {e}")

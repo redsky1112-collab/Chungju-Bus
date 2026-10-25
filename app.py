@@ -1,5 +1,6 @@
 import difflib
 import math
+import re
 import urllib.parse
 from collections import Counter
 import xml.etree.ElementTree as ET
@@ -228,11 +229,65 @@ def _query_variants(query):
   return dedupe(exact), dedupe(loose)[:8]
 
 
-def fuzzy_search_stations(city_code, query):
+@st.cache_data(ttl=86400, show_spinner=False)
+def all_stations(city_code):
+  """도시의 전체 정류장 목록 (하루 캐시)."""
+  stations, page_size = [], None
+  for page in range(1, 31):
+    items = call_api(
+        "BusSttnInfoInqireService",
+        "getSttnNoList",
+        cityCode=city_code,
+        numOfRows=1000,
+        pageNo=page,
+    )
+    stations.extend(items)
+    # 서버가 한 페이지 최대 건수를 1000보다 작게 제한할 수도 있어 첫 페이지 크기를 기준으로 판단
+    page_size = page_size or len(items)
+    if not items or len(items) < page_size:
+      break
+  return stations
+
+
+def _norm(text):
+  return re.sub(r"[\s().\-·]", "", str(text or ""))
+
+
+def match_score(query, name):
+  """0~1. 포함 관계 > 공통 부분 문자열 > 전체 유사도 순으로 점수를 준다."""
+  q, n = _norm(query), _norm(name)
+  if not q or not n:
+    return 0.0
+  if q == n:
+    return 1.0
+  if q in n or n in q:
+    return 0.5 + 0.4 * min(len(q), len(n)) / max(len(q), len(n))
+  matcher = difflib.SequenceMatcher(None, q, n)
+  common = matcher.find_longest_match(0, len(q), 0, len(n)).size
+  partial = common / len(q) if common >= 2 else 0
+  return 0.85 * max(matcher.ratio(), partial)
+
+
+def fuzzy_search_stations(city_code, query, limit=20):
   q = query.strip()
+  try:
+    stations = all_stations(city_code)
+  except ApiError:
+    stations = []
+
+  if stations:
+    if q.isdigit():
+      hits = [s for s in stations if q in str(s.get("nodeno", ""))]
+      hits.sort(key=lambda s: str(s.get("nodeno")) != q)
+      return hits[:limit], q
+    scored = [(match_score(q, s.get("nodenm")), s) for s in stations]
+    scored = [x for x in scored if x[0] >= 0.45]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [s for _, s in scored[:limit]], q
+
+  # 전체 목록을 못 받으면 검색어를 바꿔 가며 API로 찾는다
   if q.isdigit():
     return search_stations(city_code, ars_no=q), q
-
   exact, loose = _query_variants(q)
   found = {}
   for variant in exact:
@@ -246,14 +301,8 @@ def fuzzy_search_stations(city_code, query):
       if found:
         used = variant
         break
-
-  compact = q.replace(" ", "")
   ranked = sorted(
-      found.values(),
-      key=lambda s: difflib.SequenceMatcher(
-          None, compact, str(s.get("nodenm", "")).replace(" ", "")
-      ).ratio(),
-      reverse=True,
+      found.values(), key=lambda s: match_score(q, s.get("nodenm")), reverse=True
   )
   return ranked, used
 
@@ -300,7 +349,7 @@ def pick_station_by_name(city_code, query, key):
 
   if used != query.strip():
     st.info(f"'{query}'와(과) 정확히 일치하는 정류소가 없어 '{used}'(으)로 찾았습니다.")
-  st.success(f"📍 '{query}' 관련 정류소 {len(items)}개를 찾았습니다. (비슷한 순)")
+  st.success(f"📍 '{query}'와(과) 비슷한 정류소 {len(items)}개 (비슷한 순)")
   stations = [_station(s, city_code) for s in items]
   return _pick(stations, key, lambda s: f"{s['nodenm']} (ARS: {s['nodeno']})")
 
@@ -436,10 +485,13 @@ def show_arrivals(station):
   return a_items, contexts
 
 
-COLOR_STATION = [255, 75, 75]   # 빨강
-COLOR_NEXT_BUS = [255, 164, 33]  # 주황
-COLOR_BUS = [28, 131, 225]  # 파랑
-COLOR_ME = [33, 195, 84]  # 초록
+MARKER_COLORS = {
+    "station": [230, 30, 30],  # 빨강: 출발 정류장
+    "next": [255, 140, 0],  # 주황: 곧 도착할 버스
+    "bus": [20, 100, 230],  # 파랑: 운행 중인 버스
+    "me": [20, 170, 60],  # 초록: 내 현재 위치
+}
+MARKER_PIXELS = {"station": 11, "next": 10, "bus": 8, "me": 7}
 
 
 def show_bus_location(station, arrivals, contexts, key):
@@ -514,8 +566,7 @@ def show_bus_location(station, arrivals, contexts, key):
       points.append({
           "lat": lat,
           "lon": lon,
-          "color": COLOR_NEXT_BUS if is_next else COLOR_BUS,
-          "radius": 12 if is_next else 9,
+          "kind": "next" if is_next else "bus",
           "label": f"{'🟠 곧 도착 ' if is_next else '🔵 '}{routeno}번 {b.get('vehicleno', '')}"
                    f" · {b.get('nodenm', '')}",
       })
@@ -529,16 +580,14 @@ def show_bus_location(station, arrivals, contexts, key):
     points.append({
         "lat": station["lat"],
         "lon": station["lon"],
-        "color": COLOR_STATION,
-        "radius": 14,
+        "kind": "station",
         "label": f"🔴 출발 정류장 · {station['nodenm']}",
     })
   if station.get("me"):
     points.append({
         "lat": station["me"][0],
         "lon": station["me"][1],
-        "color": COLOR_ME,
-        "radius": 8,
+        "kind": "me",
         "label": "🟢 내 현재 위치",
     })
   if not points:
@@ -554,22 +603,30 @@ def show_bus_location(station, arrivals, contexts, key):
   pts = pd.DataFrame(points)
   center_lat = station["lat"] or pts["lat"].mean()
   center_lon = station["lon"] or pts["lon"].mean()
+  layers = []
+  # 내 위치 → 버스 → 곧 도착 버스 → 정류장 순으로 그려 정류장이 가장 위에 보이게 한다
+  for kind in ("me", "bus", "next", "station"):
+    group = pts[pts["kind"] == kind]
+    if group.empty:
+      continue
+    layers.append(
+        pdk.Layer(
+            "ScatterplotLayer",
+            data=group,
+            get_position=["lon", "lat"],
+            get_fill_color=MARKER_COLORS[kind],
+            get_radius=40,
+            radius_min_pixels=MARKER_PIXELS[kind],
+            radius_max_pixels=MARKER_PIXELS[kind] + 6,
+            stroked=True,
+            get_line_color=[255, 255, 255],
+            line_width_min_pixels=2,
+            pickable=True,
+        )
+    )
   st.pydeck_chart(
       pdk.Deck(
-          layers=[
-              pdk.Layer(
-                  "ScatterplotLayer",
-                  data=pts,
-                  get_position="[lon, lat]",
-                  get_fill_color="color",
-                  get_radius="radius",
-                  radius_units="pixels",
-                  stroked=True,
-                  get_line_color=[255, 255, 255],
-                  line_width_min_pixels=2,
-                  pickable=True,
-              )
-          ],
+          layers=layers,
           initial_view_state=pdk.ViewState(
               latitude=center_lat, longitude=center_lon, zoom=13
           ),
@@ -608,9 +665,9 @@ with tab1:
       key="city_t1",
   )
   start_station = st.text_input(
-      "출발지",
+      "출발지 (입력 후 엔터)",
       value="",
-      placeholder="예: 오송역, 롯데아울렛, 3223",
+      placeholder="예: 오송역, 대광로제비앙, 3223",
       key="start_stn",
   )
   destination = st.text_input(
@@ -628,7 +685,10 @@ with tab1:
       "📍 내 위치로 찾기", width="stretch", key="gps_t1_btn"
   )
 
-  if search_clicked:
+  # 엔터로 입력을 바꿔도 바로 검색
+  typed = start_station.strip() and start_station != st.session_state.get("last_q_t1")
+  st.session_state["last_q_t1"] = start_station
+  if search_clicked or typed:
     if start_station.strip():
       st.session_state["src_t1"] = (
           "name",

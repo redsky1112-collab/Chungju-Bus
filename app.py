@@ -74,6 +74,16 @@ def call_api(service, operation, **params):
           f"알 수 없는 응답 (HTTP {res.status_code}): {res.text[:300]}"
       )
 
+    # 키 오류가 JSON 형식(OpenAPI_ServiceResponse)으로 오는 경우
+    auth = data.get("OpenAPI_ServiceResponse", {}).get("cmmMsgHeader")
+    if auth:
+      code = auth.get("returnReasonCode", "")
+      msg = auth.get("returnAuthMsg") or auth.get("errMsg")
+      raise ApiError(
+          f"API 인증/권한 오류: {msg} (코드 {code}, HTTP {res.status_code})\n"
+          "→ 활용신청 승인 여부, 키 반영 대기(최대 1~2시간), 일일 트래픽 초과를 확인하세요."
+      )
+
     header = data.get("response", {}).get("header", {})
     if header.get("resultCode") not in (None, "00", "0"):
       raise ApiError(

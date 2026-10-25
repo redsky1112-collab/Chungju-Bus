@@ -135,7 +135,7 @@ def search_stations(city_code, name):
 def get_arrivals(city_code, node_id):
   return call_api(
       "ArvlInfoInqireService",
-      "getSttnAcctoArvlPregeInfoList",
+      "getSttnAcctoArvlPrearngeInfoList",
       cityCode=city_code,
       nodeId=node_id,
       numOfRows=50,

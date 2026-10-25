@@ -700,7 +700,8 @@ def show_bus_location(station, arrivals, contexts, key, preferred_route=None):
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def _geocode(query):
+def _geocode(query, near):
+  lat, lon = near
   res = requests.get(
       "https://nominatim.openstreetmap.org/search",
       params={
@@ -709,6 +710,9 @@ def _geocode(query):
           "countrycodes": "kr",
           "limit": 5,
           "accept-language": "ko",
+          # 출발지 주변(약 ±50km) 결과를 우선
+          "viewbox": f"{lon - 0.5},{lat + 0.5},{lon + 0.5},{lat - 0.5}",
+          "bounded": 0,
       },
       headers={"User-Agent": "chungju-bus-streamlit-app"},
       timeout=TIMEOUT,
@@ -725,10 +729,10 @@ def _geocode(query):
   ]
 
 
-def geocode(query):
+def geocode(query, near):
   """도착지 이름 → 좌표 후보 (OpenStreetMap). 실패 시 빈 목록 (캐시하지 않음)."""
   try:
-    return _geocode(query)
+    return _geocode(query, (round(near[0], 1), round(near[1], 1)))
   except (requests.RequestException, ValueError, KeyError):
     return []
 
@@ -755,15 +759,49 @@ def naver_route_url(station, place):
   return None
 
 
+def dest_stops_by_name(city_code, query, limit=8):
+  """이름에 도착지 이름이 들어간 정류장 (예: '오창' → 오창터미널, 오창읍사무소)."""
+  q = _norm(query)
+  if len(q) < 2:
+    return []
+  try:
+    stations = all_stations(city_code)
+  except ApiError:
+    return []
+  hits = []
+  for s in stations:
+    n = _norm(s.get("nodenm"))
+    if q in n or (len(n) >= 3 and n in q):
+      hits.append((match_score(query, s.get("nodenm")), s))
+  hits.sort(key=lambda x: x[0], reverse=True)
+  stops = [_station(s, city_code) for _, s in hits[:limit]]
+  return [s for s in stops if s["lat"] and s["lon"]]
+
+
 def pick_destination(station, destination):
-  """도착지 이름을 좌표로 바꾼다. 못 찾으면 네이버지도 웹 검색 버튼만 보여준다."""
+  """도착지 이름을 좌표와 도착 후보 정류장으로 바꾼다. 못 찾으면 네이버지도 검색 버튼만."""
   dest = destination.strip()
   if not dest:
     st.caption("도착지를 입력하면 경로 안내와 네이버지도 길찾기를 볼 수 있습니다.")
     return None
+  if not (station["lat"] and station["lon"]):
+    return None
 
-  places = geocode(dest) if station["lat"] and station["lon"] else []
-  if not places:
+  places = geocode(dest, (station["lat"], station["lon"]))
+  name_stops = dest_stops_by_name(station["citycode"], dest)
+
+  if places:
+    place = places[0]
+    if len(places) > 1:
+      options = {f"{p['name']} · {p['addr']}": p for p in places}
+      place = options[
+          st.selectbox("도착지를 선택하세요", list(options.keys()), key="dest_pick")
+      ]
+    place = dict(place)
+  elif name_stops:
+    first = name_stops[0]
+    place = {"name": dest, "addr": "", "lat": first["lat"], "lon": first["lon"]}
+  else:
     st.link_button(
         f"🗺️ 네이버지도에서 '{dest}' 찾기",
         "https://map.naver.com/p/search/" + urllib.parse.quote(dest),
@@ -771,12 +809,9 @@ def pick_destination(station, destination):
     )
     return None
 
-  if len(places) == 1:
-    return places[0]
-  options = {f"{p['name']} · {p['addr']}": p for p in places}
-  return options[
-      st.selectbox("도착지를 선택하세요", list(options.keys()), key="dest_pick")
-  ]
+  # 도착 지점: 지도 위치 + 이름이 맞는 정류장들 (지역 이름으로 검색해도 찾도록)
+  place["dest_stops"] = name_stops
+  return place
 
 
 def show_naver_buttons(station, place):
@@ -867,7 +902,13 @@ def _leg(route, stops, i, j, city):
 @st.cache_data(ttl=600, show_spinner=False)
 def plan_routes(start, place):
   """출발 승강장 → 도착지 시내버스 경로 후보 (최대 3개)."""
-  dest = (place["lat"], place["lon"])
+  targets = [(place["lat"], place["lon"])] + [
+      (s["lat"], s["lon"]) for s in place.get("dest_stops", [])
+  ]
+
+  def walk_to_dest(stop):
+    p = _pt(stop)
+    return min(_dist(p, t) for t in targets)
 
   # 출발: 선택한 승강장 + 길 건너 등 근처 승강장
   starts = [start] + [
@@ -879,8 +920,11 @@ def plan_routes(start, place):
   start_by_id = {s["nodeid"]: s for s in starts}
   a_routes = _routes_through(starts)
 
-  # 도착지 근처 정류장을 지나는 노선 (환승용)
-  b_routes = _routes_through(_nearby(dest[0], dest[1], 6))
+  # 도착지 근처 정류장과 이름이 맞는 정류장을 지나는 노선 (환승용)
+  dest_side = _nearby(place["lat"], place["lon"], 6)
+  seen_ids = {s["nodeid"] for s in dest_side}
+  dest_side += [s for s in place.get("dest_stops", []) if s["nodeid"] not in seen_ids]
+  b_routes = _routes_through(dest_side)
 
   options = []
 
@@ -900,8 +944,8 @@ def plan_routes(start, place):
     ahead = range(i + 1, min(len(stops), i + 1 + MAX_RIDE_STOPS))
     if not ahead:
       continue
-    j = min(ahead, key=lambda j: _dist(_pt(stops[j]), dest))
-    walk_end = _dist(_pt(stops[j]), dest)
+    j = min(ahead, key=lambda j: walk_to_dest(stops[j]))
+    walk_end = walk_to_dest(stops[j])
     if walk_end > MAX_WALK_M:
       continue
     walk_start = walk_from_start(board)
@@ -919,8 +963,8 @@ def plan_routes(start, place):
   grid = {}
   b_info = []
   for (city, _), (route, stops) in b_routes.items():
-    k = min(range(len(stops)), key=lambda k: _dist(_pt(stops[k]), dest))
-    walk_end = _dist(_pt(stops[k]), dest)
+    k = min(range(len(stops)), key=lambda k: walk_to_dest(stops[k]))
+    walk_end = walk_to_dest(stops[k])
     if walk_end > MAX_WALK_M or k == 0:
       continue
     b_idx = len(b_info)
@@ -1075,9 +1119,12 @@ def show_route_guide(station, place, arrivals):
     steps.append(
         f"🚌 {rides}개 정류장 이동 → {icon} **{_stop_label(off)}** 하차{bell}"
     )
-  steps.append(
-      f"🏁 **{place['name']}**까지 걸어서 {_fmt_walk(o['walk_end'])}"
-  )
+  if o["walk_end"] < 50:
+    steps.append(f"🏁 **{place['name']}** 도착")
+  else:
+    steps.append(
+        f"🏁 **{place['name']}**까지 걸어서 {_fmt_walk(o['walk_end'])}"
+    )
   st.markdown("\n".join(f"{n}. {step}" for n, step in enumerate(steps, 1)))
 
   for leg in o["legs"]:
@@ -1121,10 +1168,11 @@ def show_route_map(o, place):
             "lat": lat, "lon": lon, "kind": kind,
             "label": f"{text} · {stop.get('nodenm')}",
         })
-  points.append({
-      "lat": place["lat"], "lon": place["lon"], "kind": "dest",
-      "label": f"도착지 · {place['name']}",
-  })
+  if o["walk_end"] >= 50:  # 하차 정류장이 곧 도착지면 따로 표시하지 않음
+    points.append({
+        "lat": place["lat"], "lon": place["lon"], "kind": "dest",
+        "label": f"도착지 · {place['name']}",
+    })
   pts = pd.DataFrame(points)
   for kind in ("board", "transfer", "alight", "dest"):
     group = pts[pts["kind"] == kind]

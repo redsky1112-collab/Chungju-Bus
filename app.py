@@ -11,12 +11,43 @@ st.set_page_config(
 )
 
 st.title("🚌 스마트 대중교통 경로 & 실시간 안내판")
-st.caption("💡 인증키 입력 없이 바로 사용하는 실시간 버스 정보 서비스")
+st.caption("💡 새 인증키 적용 완료! 실시간 정류소 및 버스 번호 안내 서비스")
 
-# 📌 인증키 영구 고정 (더 이상 입력할 필요 없음)
+# 📌 재발급받으신 신규 인증키 적용
 FIXED_API_KEY = (
-    "6e4f3ef02b705a609c52db54bb93f9399b194946978c606d2a6fbb4ac6242223"
+    "9dee46a7fb260691759bcc48c371d7c750807ac380b0555594a696840e11bafe"
 )
+
+
+# 📌 API 지원 전체 도시 목록 불러오기
+@st.cache_data(ttl=3600)
+def get_city_list():
+  try:
+    url = f"https://apis.data.go.kr/1613000/BusSttnInfoInqireService/getCityList?serviceKey={FIXED_API_KEY}&_type=json"
+    res = requests.get(url, timeout=5)
+    if res.status_code == 200:
+      items = (
+          res.json()
+          .get("response", {})
+          .get("body", {})
+          .get("items", {})
+          .get("item", [])
+      )
+      if isinstance(items, dict):
+        items = [items]
+      if items:
+        return {
+            f"{item.get('cityname')} ({item.get('citycode')})": str(
+                item.get("citycode")
+            )
+            for item in items
+        }
+  except Exception:
+    pass
+  return {"청주시 (33010)": "33010", "세종특별자치시 (12)": "12"}
+
+
+city_dict = get_city_list()
 
 tab1, tab2 = st.tabs(["🧭 출발 정류소 맞춤 버스 조회", "⏱️ 일반 정류소 실시간 검색"])
 
@@ -30,16 +61,19 @@ with tab1:
       " 버스 번호와 도착 예정 시간을 바로 확인하실 수 있습니다."
   )
 
-  city_dict_tab1 = {
-      "청주시 (33010)": "33010",
-      "서울특별시 (11)": "11",
-      "세종특별자치시 (29)": "29",
-      "대전광역시 (25)": "25",
-  }
+  default_idx = 0
+  for idx, name in enumerate(city_dict.keys()):
+    if "청주" in name:
+      default_idx = idx
+      break
+
   selected_city_t1 = st.selectbox(
-      "지역 선택 (출발지)", list(city_dict_tab1.keys()), key="city_t1"
+      "지역 선택 (출발지)",
+      list(city_dict.keys()),
+      index=default_idx,
+      key="city_t1",
   )
-  city_code_t1 = city_dict_tab1[selected_city_t1]
+  city_code_t1 = city_dict[selected_city_t1]
 
   start_station = st.text_input(
       "출발 정류소 이름 입력",
@@ -76,7 +110,9 @@ with tab1:
             data = res.json()
             body = data.get("response", {}).get("body", {})
             items_container = body.get("items", {})
-            items = items_container.get("item", []) if items_container else []
+            items = (
+                items_container.get("item", []) if items_container else []
+            )
             if isinstance(items, dict):
               items = [items]
 
@@ -165,16 +201,10 @@ with tab1:
 with tab2:
   st.subheader("⏱️ 정류소 이름 검색 및 도착 예정 시간")
 
-  city_dict = {
-      "청주시 (33010)": "33010",
-      "서울특별시 (11)": "11",
-      "세종특별자치시 (29)": "29",
-      "대전광역시 (25)": "25",
-  }
-  selected_city = st.selectbox(
-      "지역 선택", list(city_dict.keys()), key="city_t2"
+  selected_city_t2 = st.selectbox(
+      "지역 선택", list(city_dict.keys()), index=default_idx, key="city_t2"
   )
-  city_code = city_dict[selected_city]
+  city_code_t2 = city_dict[selected_city_t2]
 
   station_query = st.text_input(
       "정류소 이름", value="오송역", key="query_t2"
@@ -186,7 +216,7 @@ with tab2:
         encoded_q = urllib.parse.quote(station_query)
         sttn_url = (
             "https://apis.data.go.kr/1613000/BusSttnInfoInqireService/getSttnNoList"
-            f"?serviceKey={FIXED_API_KEY}&cityCode={city_code}&nodeNm={encoded_q}&numOfRows=10&pageNo=1&_type=json"
+            f"?serviceKey={FIXED_API_KEY}&cityCode={city_code_t2}&nodeNm={encoded_q}&numOfRows=10&pageNo=1&_type=json"
         )
         res = requests.get(sttn_url, timeout=5)
 
@@ -204,7 +234,7 @@ with tab2:
 
             arvl_url = (
                 "https://apis.data.go.kr/1613000/ArvlInfoInqireService/getSttnAcctoArvlPregeInfoList"
-                f"?serviceKey={FIXED_API_KEY}&cityCode={city_code}&nodeId={chosen_node}&numOfRows=20&pageNo=1&_type=json"
+                f"?serviceKey={FIXED_API_KEY}&cityCode={city_code_t2}&nodeId={chosen_node}&numOfRows=20&pageNo=1&_type=json"
             )
             arvl_res = requests.get(arvl_url, timeout=5)
 

@@ -3,6 +3,7 @@ import math
 import re
 import urllib.parse
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 import xml.etree.ElementTree as ET
 
 import pandas as pd
@@ -321,15 +322,63 @@ def _station(s, city_code, dist=None):
   }
 
 
-def _pick(stations, key, label_fn):
+@st.cache_data(ttl=86400, show_spinner=False)
+def station_direction(city_code, node_id):
+  """정류장을 지나는 노선들의 다음 정류장 중 가장 많은 것을 방향으로 본다."""
+  routes = call_api(
+      "BusSttnInfoInqireService",
+      "getSttnThrghRouteList",
+      cityCode=city_code,
+      nodeid=node_id,
+      numOfRows=100,
+      pageNo=1,
+  )
+  nexts = []
+  for route in routes[:3]:
+    stops = get_route_stops(city_code, route.get("routeid"))
+    for i, stop in enumerate(stops):
+      if stop.get("nodeid") == node_id:
+        if i + 1 < len(stops):
+          nexts.append(stops[i + 1].get("nodenm"))
+        break
+  return Counter(nexts).most_common(1)[0][0] if nexts else ""
+
+
+def add_directions(stations, limit=10):
+  """후보 정류장들의 진행 방향을 병렬로 구해 station['dir']에 넣는다."""
+  targets = stations[:limit]
+
+  def work(station):
+    try:
+      return station_direction(station["citycode"], station["nodeid"])
+    except ApiError:
+      return ""
+
+  with st.spinner("승강장 방향 확인 중..."):
+    with ThreadPoolExecutor(max_workers=8) as pool:
+      for station, direction in zip(targets, pool.map(work, targets)):
+        station["dir"] = direction
+
+
+def _station_label(s):
+  label = f"{s['nodenm']} (ARS: {s['nodeno']})"
+  if s.get("dir"):
+    label += f" → {s['dir']} 방향"
+  if s.get("dist") is not None:
+    label += f" · {_fmt_dist(s['dist'])}"
+  return label
+
+
+def _pick(stations, key):
+  add_directions(stations)
   options = {}
   for st_ in stations:
-    label = label_fn(st_)
+    label = _station_label(st_)
     if label in options:
       label = f"{label} [{st_['nodeid']}]"
     options[label] = st_
   label = st.selectbox(
-      "조회할 정확한 승강장을 선택하세요", list(options.keys()), key=key
+      "탑승할 승강장을 선택하세요 (→ 진행 방향)", list(options.keys()), key=key
   )
   return options[label]
 
@@ -353,7 +402,7 @@ def pick_station_by_name(city_code, query, key):
     st.info(f"'{query}'와(과) 정확히 일치하는 정류소가 없어 '{used}'(으)로 찾았습니다.")
   st.success(f"📍 '{query}'와(과) 비슷한 정류소 {len(items)}개 (비슷한 순)")
   stations = [_station(s, city_code) for s in items]
-  return _pick(stations, key, lambda s: f"{s['nodenm']} (ARS: {s['nodeno']})")
+  return _pick(stations, key)
 
 
 def pick_station_by_gps(key, trigger):
@@ -402,11 +451,7 @@ def pick_station_by_gps(key, trigger):
     stations.append(station)
   stations.sort(key=lambda s: s["dist"] if s["dist"] is not None else 1e9)
   st.success(f"📍 현재 위치 근처 정류장 {len(stations)}개 (가까운 순)")
-  return _pick(
-      stations,
-      key,
-      lambda s: f"{s['nodenm']} (ARS: {s['nodeno']}) · {_fmt_dist(s['dist'])}",
-  )
+  return _pick(stations, key)
 
 
 ROUTE_API_HINT = (
@@ -648,111 +693,73 @@ for idx, name in enumerate(city_dict.keys()):
     default_idx = idx
     break
 
-tab1, tab2 = st.tabs(["🧭 출발 정류소 맞춤 버스 조회", "⏱️ 일반 정류소 실시간 검색"])
+st.subheader("🧭 출발 정류소 실시간 버스 번호 찾기")
+st.write(
+    "**출발지**에 정류장 이름(일부만 입력해도 됨)이나 ARS 번호를 입력하거나,"
+    " **내 위치**로 가까운 정류장을 찾으세요."
+)
 
-# ==========================================
-# TAB 1: 출발 정류소 기반 실시간 버스 번호 조회
-# ==========================================
-with tab1:
-  st.subheader("🧭 출발 정류소 실시간 버스 번호 찾기")
-  st.write(
-      "**출발지**에 정류장 이름(일부만 입력해도 됨)이나 ARS 번호를 입력하거나,"
-      " **내 위치**로 가까운 정류장을 찾으세요."
-  )
+selected_city_t1 = st.selectbox(
+    "지역 선택 (이름 검색용)",
+    list(city_dict.keys()),
+    index=default_idx,
+    key="city_t1",
+)
+start_station = st.text_input(
+    "출발지 (입력 후 엔터)",
+    value="",
+    placeholder="예: 오송역, 대광로제비앙, 3223",
+    key="start_stn",
+)
+destination = st.text_input(
+    "도착지 (카카오맵 경로용)",
+    value="청주롯데아울렛",
+    placeholder="예: 청주롯데아울렛, 청주시청",
+    key="dest_stn",
+)
 
-  selected_city_t1 = st.selectbox(
-      "지역 선택 (이름 검색용)",
-      list(city_dict.keys()),
-      index=default_idx,
-      key="city_t1",
-  )
-  start_station = st.text_input(
-      "출발지 (입력 후 엔터)",
-      value="",
-      placeholder="예: 오송역, 대광로제비앙, 3223",
-      key="start_stn",
-  )
-  destination = st.text_input(
-      "도착지 (카카오맵 경로용)",
-      value="청주롯데아울렛",
-      placeholder="예: 청주롯데아울렛, 청주시청",
-      key="dest_stn",
-  )
+col_search, col_gps = st.columns(2)
+search_clicked = col_search.button(
+    "🔎 출발지로 검색", width="stretch", key="btn_t1"
+)
+gps_clicked = col_gps.button(
+    "📍 내 위치로 찾기", width="stretch", key="gps_t1_btn"
+)
 
-  col_search, col_gps = st.columns(2)
-  search_clicked = col_search.button(
-      "🔎 출발지로 검색", width="stretch", key="btn_t1"
-  )
-  gps_clicked = col_gps.button(
-      "📍 내 위치로 찾기", width="stretch", key="gps_t1_btn"
-  )
+# 엔터로 입력을 바꿔도 바로 검색
+typed = start_station.strip() and start_station != st.session_state.get("last_q_t1")
+st.session_state["last_q_t1"] = start_station
+if search_clicked or typed:
+  if start_station.strip():
+    st.session_state["src_t1"] = (
+        "name",
+        city_dict[selected_city_t1],
+        start_station.strip(),
+    )
+  else:
+    st.warning("출발지를 입력하거나 '📍 내 위치로 찾기'를 눌러 주세요.")
+    st.session_state.pop("src_t1", None)
+if gps_clicked:
+  st.session_state["src_t1"] = ("gps",)
 
-  # 엔터로 입력을 바꿔도 바로 검색
-  typed = start_station.strip() and start_station != st.session_state.get("last_q_t1")
-  st.session_state["last_q_t1"] = start_station
-  if search_clicked or typed:
-    if start_station.strip():
-      st.session_state["src_t1"] = (
-          "name",
-          city_dict[selected_city_t1],
-          start_station.strip(),
-      )
-    else:
-      st.warning("출발지를 입력하거나 '📍 내 위치로 찾기'를 눌러 주세요.")
-      st.session_state.pop("src_t1", None)
-  if gps_clicked:
-    st.session_state["src_t1"] = ("gps",)
+station = None
+src = st.session_state.get("src_t1")
+if src and src[0] == "gps":
+  station = pick_station_by_gps("gps_t1", trigger=gps_clicked)
+elif src:
+  station = pick_station_by_name(src[1], src[2], key="pick_t1")
 
-  station = None
-  src = st.session_state.get("src_t1")
-  if src and src[0] == "gps":
-    station = pick_station_by_gps("gps_t1", trigger=gps_clicked)
-  elif src:
-    station = pick_station_by_name(src[1], src[2], key="pick_t1")
-
-  if station:
-    arrivals, contexts = show_arrivals(station)
-    if arrivals:
-      kakao_map_url = "https://map.kakao.com/?" + urllib.parse.urlencode(
-          {"sName": station["nodenm"], "eName": destination}
-      )
-      st.link_button(
-          "🗺️ 카카오맵에서 목적지까지 상세 경로 보기",
-          kakao_map_url,
-          width="stretch",
-      )
-      show_bus_location(station, arrivals, contexts, key="bus_t1")
-    if st.button("🔄 새로고침", key="refresh_t1"):
-      st.rerun()
-
-# ==========================================
-# TAB 2: 일반 정류소별 실시간 버스 도착 예정 시간
-# ==========================================
-with tab2:
-  st.subheader("⏱️ 정류소 이름 검색 및 도착 예정 시간")
-
-  selected_city_t2 = st.selectbox(
-      "지역 선택", list(city_dict.keys()), index=default_idx, key="city_t2"
-  )
-  city_code_t2 = city_dict[selected_city_t2]
-
-  station_query = st.text_input(
-      "정류소 이름 또는 ARS 번호", value="오송역", key="query_t2"
-  )
-
-  if st.button("실시간 도착 정보 검색", key="btn_t2"):
-    if station_query.strip():
-      st.session_state["search_t2"] = (city_code_t2, station_query.strip())
-    else:
-      st.warning("정류소 이름을 입력해 주세요.")
-      st.session_state.pop("search_t2", None)
-
-  if "search_t2" in st.session_state:
-    s_city, s_name = st.session_state["search_t2"]
-    station2 = pick_station_by_name(s_city, s_name, key="pick_t2")
-    if station2:
-      arrivals2, contexts2 = show_arrivals(station2)
-      if arrivals2:
-        show_bus_location(station2, arrivals2, contexts2, key="bus_t2")
-      if st.button("🔄 새로고침", key="refresh_t2"):
-        st.rerun()
+if station:
+  arrivals, contexts = show_arrivals(station)
+  if arrivals:
+    kakao_map_url = "https://map.kakao.com/?" + urllib.parse.urlencode(
+        {"sName": station["nodenm"], "eName": destination}
+    )
+    st.link_button(
+        "🗺️ 카카오맵에서 목적지까지 상세 경로 보기",
+        kakao_map_url,
+        width="stretch",
+    )
+    show_bus_location(station, arrivals, contexts, key="bus_t1")
+  if st.button("🔄 새로고침", key="refresh_t1"):
+    st.rerun()

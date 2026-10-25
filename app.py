@@ -5,6 +5,8 @@ import urllib.parse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pydeck as pdk
@@ -836,9 +838,13 @@ MAX_WALK_M = 800  # 하차 후 도착지까지 최대 도보
 TRANSFER_WALK_M = 200  # 환승 시 최대 도보
 SIBLING_STOP_M = 200  # 함께 고려할 근처 승강장 범위
 MAX_RIDE_STOPS = 70
-MIN_PER_STOP = 1.5
 WALK_M_PER_MIN = 70
-TRANSFER_PENALTY_MIN = 8
+BUS_M_PER_MIN = 330  # 시내버스 평균 약 20km/h
+ROAD_FACTOR = 1.3  # 직선거리 → 도로거리 보정
+DWELL_MIN = 0.4  # 정류장 정차 시간
+FALLBACK_MIN_PER_STOP = 1.5  # 좌표가 없을 때 정류장당 시간
+TRANSFER_WAIT_MIN = 5  # 환승 대기 예상
+TRANSFER_PENALTY_MIN = 8  # 경로 순위 계산용 환승 불편 가중치
 
 
 def _fetch_all(fn, args_list):
@@ -890,12 +896,26 @@ def _nearby(lat, lon, limit):
   return stations[:limit]
 
 
-def _leg(route, stops, i, j, city):
+def _cum_minutes(stops):
+  """노선 정류장별 누적 예상 소요시간(분): 정류장 간 거리 ÷ 평균 속도 + 정차 시간."""
+  cum = [0.0]
+  for a, b in zip(stops, stops[1:]):
+    d = _dist(_pt(a), _pt(b))
+    if d >= 1e9:
+      step = FALLBACK_MIN_PER_STOP
+    else:
+      step = d * ROAD_FACTOR / BUS_M_PER_MIN + DWELL_MIN
+    cum.append(cum[-1] + step)
+  return cum
+
+
+def _leg(route, stops, i, j, city, cum):
   return {
       "routeno": route.get("routeno"),
       "routeid": route.get("routeid"),
       "city": city,
       "stops": stops[i : j + 1],
+      "times": [t - cum[i] for t in cum[i : j + 1]],
   }
 
 
@@ -933,14 +953,17 @@ def plan_routes(start, place):
   for (city, _), (route, stops) in a_routes.items():
     for i, stop in enumerate(stops):
       if stop.get("nodeid") in start_by_id:
-        a_legs.append((city, route, stops, i, start_by_id[stop.get("nodeid")]))
+        a_legs.append((
+            city, route, stops, i, start_by_id[stop.get("nodeid")],
+            _cum_minutes(stops),
+        ))
         break
 
   def walk_from_start(board):
     return distance_m(start["lat"], start["lon"], board["lat"], board["lon"]) or 0
 
   # 직행
-  for city, route, stops, i, board in a_legs:
+  for city, route, stops, i, board, cum in a_legs:
     ahead = range(i + 1, min(len(stops), i + 1 + MAX_RIDE_STOPS))
     if not ahead:
       continue
@@ -949,9 +972,9 @@ def plan_routes(start, place):
     if walk_end > MAX_WALK_M:
       continue
     walk_start = walk_from_start(board)
-    cost = (j - i) * MIN_PER_STOP + (walk_end + walk_start) / WALK_M_PER_MIN
+    cost = (cum[j] - cum[i]) + (walk_end + walk_start) / WALK_M_PER_MIN
     options.append({
-        "legs": [_leg(route, stops, i, j, city)],
+        "legs": [_leg(route, stops, i, j, city, cum)],
         "board": board,
         "walk_start": walk_start,
         "walk_transfer": 0,
@@ -968,7 +991,7 @@ def plan_routes(start, place):
     if walk_end > MAX_WALK_M or k == 0:
       continue
     b_idx = len(b_info)
-    b_info.append((city, route, stops, k, walk_end))
+    b_info.append((city, route, stops, k, walk_end, _cum_minutes(stops)))
     for i2 in range(max(0, k - MAX_RIDE_STOPS), k):
       lat, lon = _pt(stops[i2])
       if lat is None:
@@ -977,7 +1000,7 @@ def plan_routes(start, place):
       grid.setdefault(cell, []).append((b_idx, i2))
 
   best_transfer = {}
-  for city, route, stops, i, board in a_legs:
+  for city, route, stops, i, board, cum in a_legs:
     walk_start = walk_from_start(board)
     for j in range(i + 1, min(len(stops), i + 1 + MAX_RIDE_STOPS)):
       lat, lon = _pt(stops[j])
@@ -987,7 +1010,7 @@ def plan_routes(start, place):
       for dy in (-1, 0, 1):
         for dx in (-1, 0, 1):
           for b_idx, i2 in grid.get((cy + dy, cx + dx), []):
-            b_city, b_route, b_stops, k, walk_end = b_info[b_idx]
+            b_city, b_route, b_stops, k, walk_end, b_cum = b_info[b_idx]
             # 두 번째 버스를 출발지에서 바로 탈 수 있으면 환승할 이유가 없다
             if (b_city, b_route.get("routeid")) in a_routes:
               continue
@@ -995,7 +1018,7 @@ def plan_routes(start, place):
             if walk_tr > TRANSFER_WALK_M:
               continue
             cost = (
-                ((j - i) + (k - i2)) * MIN_PER_STOP
+                (cum[j] - cum[i]) + (b_cum[k] - b_cum[i2])
                 + (walk_start + walk_tr + walk_end) / WALK_M_PER_MIN
                 + TRANSFER_PENALTY_MIN
             )
@@ -1003,8 +1026,8 @@ def plan_routes(start, place):
             if key not in best_transfer or cost < best_transfer[key]["cost"]:
               best_transfer[key] = {
                   "legs": [
-                      _leg(route, stops, i, j, city),
-                      _leg(b_route, b_stops, i2, k, b_city),
+                      _leg(route, stops, i, j, city, cum),
+                      _leg(b_route, b_stops, i2, k, b_city, b_cum),
                   ],
                   "board": board,
                   "walk_start": walk_start,
@@ -1037,11 +1060,22 @@ def _fmt_walk(m):
   return f"약 {int(round(m / 10) * 10)}m (도보 {max(1, round(m / WALK_M_PER_MIN))}분)"
 
 
+def _total_minutes(o):
+  """승차 대기를 뺀 예상 이동 시간: 버스 + 도보 + 환승 대기."""
+  ride = sum(leg["times"][-1] for leg in o["legs"])
+  walk = (o["walk_start"] + o["walk_transfer"] + o["walk_end"]) / WALK_M_PER_MIN
+  return ride + walk + TRANSFER_WAIT_MIN * (len(o["legs"]) - 1)
+
+
 def _option_title(o):
   buses = " → ".join(f"{leg['routeno']}번" for leg in o["legs"])
   kind = "직행" if len(o["legs"]) == 1 else "1회 환승"
   n = sum(len(leg["stops"]) - 1 for leg in o["legs"])
-  return f"{buses} ({kind}) · {n}개 정류장 · 약 {round(o['cost'])}분"
+  return f"{buses} ({kind}) · {n}개 정류장 · 약 {round(_total_minutes(o))}분"
+
+
+def _clock(t):
+  return t.strftime("%H:%M") if t else ""
 
 
 ROUTE_COLORS = {
@@ -1091,15 +1125,37 @@ def show_route_guide(station, place, arrivals):
         f" — {_fmt_walk(o['walk_start'])}"
     )
 
+  # 첫 버스 도착 정보가 있으면 정류장별 예상 시각을 계산한다
+  now = datetime.now(ZoneInfo("Asia/Seoul"))
+  first_arrival = (
+      arrival_by_route.get(first["routeid"])
+      if board["nodeid"] == station["nodeid"]
+      else None
+  )
+  leg_start = (
+      now + timedelta(seconds=_to_int(first_arrival.get("arrtime")))
+      if first_arrival
+      else None
+  )
+
+  leg_starts = []
   for n, leg in enumerate(o["legs"]):
     on, off = leg["stops"][0], leg["stops"][-1]
     rides = len(leg["stops"]) - 1
+    ride_min = leg["times"][-1]
     toward = leg["stops"][1].get("nodenm") if rides >= 1 else ""
+    if n > 0 and leg_start:
+      leg_start += timedelta(
+          minutes=o["walk_transfer"] / WALK_M_PER_MIN + TRANSFER_WAIT_MIN
+      )
+    leg_starts.append(leg_start)
     if n == 0:
       wait = ""
-      a = arrival_by_route.get(leg["routeid"]) if board["nodeid"] == station["nodeid"] else None
-      if a:
-        wait = f" — ⏱ 약 {_to_int(a.get('arrtime')) // 60}분 후 도착"
+      if first_arrival:
+        wait = (
+            f" — ⏱ 약 {_to_int(first_arrival.get('arrtime')) // 60}분 후"
+            f" ({_clock(leg_start)}) 도착"
+        )
       steps.append(
           f"🟢 **{_stop_label(on)}**에서 **{leg['routeno']}번** 승차"
           f" ({toward} 방향){wait}"
@@ -1116,26 +1172,46 @@ def show_route_guide(station, place, arrivals):
     before = leg["stops"][-2].get("nodenm") if rides >= 2 else None
     bell = f" — 🔔 '{before}' 지나면 하차벨" if before else ""
     icon = "🔴" if n == len(o["legs"]) - 1 else "🟠"
-    steps.append(
-        f"🚌 {rides}개 정류장 이동 → {icon} **{_stop_label(off)}** 하차{bell}"
+    off_at = (
+        f" (예상 {_clock(leg_start + timedelta(minutes=ride_min))})"
+        if leg_start else ""
     )
+    steps.append(
+        f"🚌 {rides}개 정류장, 약 {max(1, round(ride_min))}분 이동 → {icon}"
+        f" **{_stop_label(off)}** 하차{off_at}{bell}"
+    )
+    if leg_start:
+      leg_start += timedelta(minutes=ride_min)
+
+  arrive_at = (
+      f" — 예상 도착 {_clock(leg_start + timedelta(minutes=o['walk_end'] / WALK_M_PER_MIN))}"
+      if leg_start else ""
+  )
   if o["walk_end"] < 50:
-    steps.append(f"🏁 **{place['name']}** 도착")
+    steps.append(f"🏁 **{place['name']}** 도착{arrive_at}")
   else:
     steps.append(
-        f"🏁 **{place['name']}**까지 걸어서 {_fmt_walk(o['walk_end'])}"
+        f"🏁 **{place['name']}**까지 걸어서 {_fmt_walk(o['walk_end'])}{arrive_at}"
     )
   st.markdown("\n".join(f"{n}. {step}" for n, step in enumerate(steps, 1)))
+  if not first_arrival:
+    st.caption("첫 버스 도착 정보가 없어 예상 시각 대신 승차 후 걸리는 시간만 표시합니다.")
 
-  for leg in o["legs"]:
-    with st.expander(f"🚌 {leg['routeno']}번 지나는 정류장 보기 ({len(leg['stops']) - 1}개)"):
-      names = [s.get("nodenm") for s in leg["stops"]]
-      st.markdown(
-          "\n".join(
-              f"- {'**' + nm + '** (승차)' if i == 0 else '**' + nm + '** (하차)' if i == len(names) - 1 else nm}"
-              for i, nm in enumerate(names)
-          )
-      )
+  for leg, start_at in zip(o["legs"], leg_starts):
+    with st.expander(
+        f"🕒 {leg['routeno']}번 정류장별 소요시간 보기"
+        f" ({len(leg['stops']) - 1}개 정류장, 약 {max(1, round(leg['times'][-1]))}분)"
+    ):
+      lines = []
+      last = len(leg["stops"]) - 1
+      for i, (stop, t) in enumerate(zip(leg["stops"], leg["times"])):
+        name = stop.get("nodenm")
+        if i in (0, last):
+          name = f"**{name}** ({'승차' if i == 0 else '하차'})"
+        when = f"{_clock(start_at + timedelta(minutes=t))} · " if start_at else ""
+        lines.append(f"- {when}+{round(t)}분 · {name}")
+      st.markdown("\n".join(lines))
+      st.caption("거리와 평균 속도로 계산한 예상 시간이라 실제와 다를 수 있습니다.")
 
   show_route_map(o, place)
   return first["routeid"] if board["nodeid"] == station["nodeid"] else None

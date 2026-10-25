@@ -10,9 +10,7 @@ st.set_page_config(
 )
 
 st.title("🚌 스마트 대중교통 경로 & 실시간 안내판")
-st.caption(
-    "💡 출발지/도착지 맞춤형 버스 경로 안내 및 정류소 실시간 도착 정보"
-)
+st.caption("💡 출발 정류소 맞춤형 실시간 버스 번호 및 도착 정보 조회")
 
 # 세션 상태에 API 키 유지
 if "api_key" not in st.session_state:
@@ -27,83 +25,161 @@ with st.sidebar:
       "공공데이터포털 인증키", value=st.session_state.api_key, type="password"
   )
 
-tab1, tab2 = st.tabs(
-    ["🧭 출발지-도착지 경로 찾기", "⏱️ 정류소별 실시간 도착"]
-)
+tab1, tab2 = st.tabs(["🧭 출발 정류소 맞춤 버스 조회", "⏱️ 일반 정류소 실시간 검색"])
 
 # ==========================================
-# TAB 1: 출발지/도착지 기반 동적 버스 경로 안내
+# TAB 1: 출발 정류소 기반 실시간 버스 번호 조회
 # ==========================================
 with tab1:
-  st.subheader("🧭 맞춤형 최단 경로 및 버스 안내")
+  st.subheader("🧭 출발 정류소 실시간 버스 번호 찾기")
   st.write(
-      "출발지와 목적지를 입력하시면 입력하신 장소 기준으로 맞춤 버스 경로를"
-      " 안내합니다."
+      "탑승하실 **출발 정류소 이름**을 입력하시면, 해당 정류소를 경유하는 실시간"
+      " 버스 번호와 도착 예정 시간을 바로 확인하실 수 있습니다."
   )
 
-  col_start, col_end = st.columns(2)
-  with col_start:
-    start_place = st.text_input(
-        "출발지", value="오송대광로제비앙2차", placeholder="예: 오송대광로제비앙2차"
-    )
-  with col_end:
-    end_place = st.text_input(
-        "도착지", value="청주롯데아울렛", placeholder="예: 청주롯데아울렛"
-    )
+  city_dict_tab1 = {
+      "청주시 (33010)": "33010",
+      "서울특별시 (11)": "11",
+      "세종특별자치시 (29)": "29",
+      "대전광역시 (25)": "25",
+  }
+  selected_city_t1 = st.selectbox(
+      "지역 선택 (출발지)", list(city_dict_tab1.keys()), key="city_t1"
+  )
+  city_code_t1 = city_dict_tab1[selected_city_t1]
 
-  search_option = st.radio(
-      "추천 기준 선택",
-      ["⚡ 최단 시간 (빨리 도착)", "🚶‍♂️ 최소 걷기 (도보 최소화)"],
-      horizontal=True,
+  start_station = st.text_input(
+      "출발 정류소 이름 입력",
+      value="오송대광로제비앙",
+      placeholder="예: 오송대광로제비앙, 오송역",
+      key="start_stn",
+  )
+  destination = st.text_input(
+      "도착지 (참고용)",
+      value="청주롯데아울렛",
+      placeholder="예: 청주롯데아울렛, 청주시청",
+      key="dest_stn",
   )
 
-  if st.button("🚀 경로 찾기 및 탑승 정류장 안내", use_container_width=True):
-    if not start_place.strip() or not end_place.strip():
-      st.warning("출발지와 도착지를 모두 입력해 주세요.")
+  if st.button(
+      "🚀 출발 정류소 경유 버스 번호 조회",
+      use_container_width=True,
+      key="btn_t1",
+  ):
+    current_key = st.session_state.api_key
+    if not current_key:
+      st.error("사이드바에 인증키를 입력해 주세요.")
+    elif not start_station.strip():
+      st.warning("출발 정류소 이름을 입력해 주세요.")
     else:
-      st.success(
-          f"📍 **[{start_place}]** ➔ **[{end_place}]** 맞춤 버스 경로 안내"
-      )
+      with st.spinner("출발 정류소의 실시간 버스 번호 조회 중..."):
+        try:
+          # 1단계: 정류소 이름으로 정류소 ID(nodeid) 검색
+          sttn_url = "https://apis.data.go.kr/1613000/BusSttnInfoInqireService/getSttnNoList"
+          sttn_params = {
+              "serviceKey": current_key,
+              "cityCode": city_code_t1,
+              "nodeNm": start_station,
+              "numOfRows": "10",
+              "pageNo": "1",
+              "_type": "json",
+          }
+          res = requests.get(sttn_url, params=sttn_params, timeout=5)
 
-      # 카카오맵 길찾기에 출발지와 도착지가 바로 연동되도록 URL 생성
-      kakao_map_url = f"https://map.kakao.com/?sName={start_place}&eName={end_place}"
+          if res.status_code == 200:
+            data = res.json()
+            items = (
+                data.get("response", {})
+                .get("body", {})
+                .get("items", {})
+                .get("item", [])
+            )
+            if isinstance(items, dict):
+              items = [items]
 
-      if "최단 시간" in search_option:
-        st.markdown(
-            f"""
-                ### ⚡ [{start_place} ➔ {end_place}] 최단시간 추천 경로
-                * **출발지 인근 정류장**: `{start_place}` 주변 도보 3분 거리 정류장
-                * **추천 버스 노선**: <span style="color:#2E7D32; font-weight:bold; font-size:18px;">급행버스 / 간선버스 연계 노선</span>
-                * **도착지 인근 정류장**: `{end_place}` 하차 정류장
-                * **예상 소요 시간**: 교통 상황에 따라 상이 (약 30~45분 소요)
-                """,
-            unsafe_allow_html=True,
-        )
-      else:
-        st.markdown(
-            f"""
-                ### 🚶‍♂️ [{start_place} ➔ {end_place}] 최소도보 추천 경로
-                * **출발지 인근 정류장**: `{start_place}` 가장 가까운 단지 앞 정류장
-                * **추천 버스 노선**: <span style="color:#1565C0; font-weight:bold; font-size:18px;">최소 환승 및 도보 최적화 노선</span>
-                * **도착지 인근 정류장**: `{end_place}` 도보 1~2분 거리 정류장
-                * **예상 소요 시간**: 도보 이동 최소화 경로
-                """,
-            unsafe_allow_html=True,
-        )
+            if items:
+              st.success(
+                  f"📍 '{start_station}' 관련 정류소를 찾았습니다! (총"
+                  f" {len(items)}개소)"
+              )
 
-      st.info(
-          "💡 **실시간 지도 연동**: 아래 버튼을 누르시면 입력하신 **출발지("
-          f"{start_place})**와 **도착지({end_place})**가 카카오맵 길찾기에"
-          " 자동으로 연동되어 상세한 대중교통 경로를 확인하실 수 있습니다."
-      )
-      st.link_button(
-          "🗺️ 카카오맵에서 상세 경로 및 실시간 위치 보기",
-          kakao_map_url,
-          use_container_width=True,
-      )
+              # 검색된 정류소 선택 옵션 생성
+              station_options = {
+                  f"{s.get('nodenm')} (ARS: {s.get('nodeno', '-')})": s.get(
+                      "nodeid"
+                  )
+                  for s in items
+              }
+              chosen_label = st.selectbox(
+                  "조회할 정확한 승강장을 선택하세요", list(station_options.keys())
+              )
+              chosen_node_id = station_options[chosen_label]
+
+              # 2단계: 선택된 정류소의 실시간 도착 버스 정보 조회
+              arvl_url = "https://apis.data.go.kr/1613000/ArvlInfoInqireService/getSttnAcctoArvlPregeInfoList"
+              arvl_params = {
+                  "serviceKey": current_key,
+                  "cityCode": city_code_t1,
+                  "nodeId": chosen_node_id,
+                  "numOfRows": "20",
+                  "pageNo": "1",
+                  "_type": "json",
+              }
+              arvl_res = requests.get(arvl_url, params=arvl_params, timeout=5)
+
+              if arvl_res.status_code == 200:
+                a_data = arvl_res.json()
+                a_items = (
+                    a_data.get("response", {})
+                    .get("body", {})
+                    .get("items", {})
+                    .get("item", [])
+                )
+                if isinstance(a_items, dict):
+                  a_items = [a_items]
+
+                if a_items:
+                  st.markdown(
+                      f"### 🚍 [{chosen_label}] 경유 실시간 버스 도착 정보"
+                  )
+                  rows = []
+                  for item in a_items:
+                    sec = int(item.get("arrtime", 0))
+                    rows.append({
+                        "탑승 버스번호": item.get("routeno"),
+                        "남은 시간": f"약 {sec // 60}분 ({sec}초 후)",
+                        "남은 정류장": f"{item.get('arrprevstationcnt')}개 전",
+                        "차량 유형": item.get("vehicletp", "일반"),
+                    })
+                  st.dataframe(
+                      pd.DataFrame(rows), use_container_width=True
+                  )
+
+                  # 카카오맵 연동 버튼
+                  kakao_map_url = f"https://map.kakao.com/?sName={start_station}&eName={destination}"
+                  st.link_button(
+                      "🗺️ 카카오맵에서 목적지까지 상세 경로(하차 정류장 포함) 보기",
+                      kakao_map_url,
+                      use_container_width=True,
+                  )
+                else:
+                  st.info(
+                      "현재 해당 출발 정류소에 도착 예정인 버스 노선이 없습니다."
+                  )
+              else:
+                st.error("실시간 도착 정보를 불러오지 못했습니다.")
+            else:
+              st.warning(
+                  f"'{start_station}'에 해당하는 정류소를 찾지 못했습니다."
+                  " 정류소 이름을 다시 확인해 주세요."
+              )
+          else:
+            st.error("API 서버 통신에 실패했습니다.")
+        except Exception as e:
+          st.error(f"오류 발생: {e}")
 
 # ==========================================
-# TAB 2: 정류소별 실시간 버스 도착 예정 시간
+# TAB 2: 일반 정류소별 실시간 버스 도착 예정 시간
 # ==========================================
 with tab2:
   st.subheader("⏱️ 정류소 이름 검색 및 도착 예정 시간")
@@ -114,12 +190,16 @@ with tab2:
       "세종특별자치시 (29)": "29",
       "대전광역시 (25)": "25",
   }
-  selected_city = st.selectbox("지역 선택", list(city_dict.keys()))
+  selected_city = st.selectbox(
+      "지역 선택", list(city_dict.keys()), key="city_t2"
+  )
   city_code = city_dict[selected_city]
 
-  station_query = st.text_input("정류소 이름", value="오송역")
+  station_query = st.text_input(
+      "정류소 이름", value="오송역", key="query_t2"
+  )
 
-  if st.button("실시간 도착 정보 검색"):
+  if st.button("실시간 도착 정보 검색", key="btn_t2"):
     current_key = st.session_state.api_key
     if not current_key:
       st.error("사이드바에 인증키를 입력해 주세요.")
@@ -188,8 +268,6 @@ with tab2:
                 else:
                   st.info("현재 도착 예정인 버스가 없습니다.")
           else:
-            st.error(
-                "API 서버 응답 대기 중입니다. 잠시 후 다시 검색해 주세요."
-            )
+            st.error("API 서버 응답 대기 중입니다.")
         except Exception as e:
           st.error(f"오류 발생: {e}")

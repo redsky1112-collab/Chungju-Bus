@@ -20,7 +20,7 @@ st.set_page_config(
 )
 
 st.title("🚌 스마트 대중교통 경로 & 실시간 안내판")
-st.caption("💡 실시간 정류소 및 버스 번호 안내 서비스 (카카오맵 연동)")
+st.caption("💡 실시간 정류소 및 버스 번호 안내 서비스 (네이버지도 길찾기 연동)")
 
 API_KEY = "9dee46a7fb260691759bcc48c371d7c750807ac380b0555594a696840e11bafe"
 
@@ -688,6 +688,97 @@ def show_bus_location(station, arrivals, contexts, key):
   st.caption("점을 누르면 무엇인지 표시됩니다.")
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def _geocode(query):
+  res = requests.get(
+      "https://nominatim.openstreetmap.org/search",
+      params={
+          "q": query,
+          "format": "json",
+          "countrycodes": "kr",
+          "limit": 5,
+          "accept-language": "ko",
+      },
+      headers={"User-Agent": "chungju-bus-streamlit-app"},
+      timeout=TIMEOUT,
+  )
+  res.raise_for_status()
+  return [
+      {
+          "name": r.get("name") or query,
+          "addr": ", ".join(r.get("display_name", "").split(", ")[1:4]),
+          "lat": float(r["lat"]),
+          "lon": float(r["lon"]),
+      }
+      for r in res.json()
+  ]
+
+
+def geocode(query):
+  """도착지 이름 → 좌표 후보 (OpenStreetMap). 실패 시 빈 목록 (캐시하지 않음)."""
+  try:
+    return _geocode(query)
+  except (requests.RequestException, ValueError, KeyError):
+    return []
+
+
+def naver_route_url(station, place):
+  params = urllib.parse.urlencode({
+      "slat": station["lat"],
+      "slng": station["lon"],
+      "sname": station["nodenm"],
+      "dlat": place["lat"],
+      "dlng": place["lon"],
+      "dname": place["name"],
+      "appname": "chungju-bus.streamlit.app",
+  })
+  user_agent = st.context.headers.get("User-Agent", "")
+  if "Android" in user_agent:
+    # 앱이 없으면 플레이스토어 네이버지도 페이지로 이동
+    return (
+        f"intent://route/public?{params}"
+        "#Intent;scheme=nmap;package=com.nhn.android.nmap;end"
+    )
+  if any(k in user_agent for k in ("iPhone", "iPad", "iPod")):
+    return f"nmap://route/public?{params}"
+  return None
+
+
+def show_naver_route(station, destination):
+  dest = destination.strip()
+  if not dest:
+    st.caption("도착지를 입력하면 네이버지도 대중교통 길찾기를 바로 열 수 있습니다.")
+    return
+
+  web_search = "https://map.naver.com/p/search/" + urllib.parse.quote(dest)
+  places = geocode(dest) if station["lat"] and station["lon"] else []
+  if not places:
+    st.link_button(
+        f"🗺️ 네이버지도에서 '{dest}' 찾기", web_search, width="stretch"
+    )
+    return
+
+  place = places[0]
+  if len(places) > 1:
+    options = {f"{p['name']} · {p['addr']}": p for p in places}
+    place = options[
+        st.selectbox("도착지를 선택하세요", list(options.keys()), key="dest_pick")
+    ]
+
+  url = naver_route_url(station, place)
+  if url:
+    st.link_button(
+        f"🧭 네이버지도로 길찾기: {station['nodenm']} → {place['name']}",
+        url,
+        type="primary",
+        width="stretch",
+    )
+    st.caption("네이버지도 앱이 열리지 않으면 아래 버튼으로 웹에서 찾아보세요.")
+  st.link_button(
+      f"🗺️ 네이버지도 웹에서 '{dest}' 찾기", web_search, width="stretch"
+  )
+
+
 city_dict, city_err = get_city_list()
 if city_err:
   st.warning(f"도시 목록을 불러오지 못해 기본 목록을 사용합니다.\n\n{city_err}")
@@ -717,9 +808,9 @@ start_station = st.text_input(
     key="start_stn",
 )
 destination = st.text_input(
-    "도착지 (카카오맵 경로용)",
-    value="청주롯데아울렛",
-    placeholder="예: 청주롯데아울렛, 청주시청",
+    "도착지 (네이버지도 대중교통 길찾기용)",
+    value="",
+    placeholder="예: 대전역, 서울고속버스터미널, 청주롯데아울렛",
     key="dest_stn",
 )
 
@@ -756,15 +847,8 @@ elif src:
 
 if station:
   arrivals, contexts = show_arrivals(station)
+  show_naver_route(station, destination)
   if arrivals:
-    kakao_map_url = "https://map.kakao.com/?" + urllib.parse.urlencode(
-        {"sName": station["nodenm"], "eName": destination}
-    )
-    st.link_button(
-        "🗺️ 카카오맵에서 목적지까지 상세 경로 보기",
-        kakao_map_url,
-        width="stretch",
-    )
     show_bus_location(station, arrivals, contexts, key="bus_t1")
   if st.button("🔄 새로고침", key="refresh_t1"):
     st.rerun()

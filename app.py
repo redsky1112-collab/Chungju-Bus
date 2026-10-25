@@ -25,6 +25,7 @@ st.title("🚌 스마트 대중교통 경로 & 실시간 안내판")
 st.caption("💡 실시간 정류소 및 버스 번호 안내 서비스 (네이버지도 길찾기 연동)")
 
 API_KEY = "9dee46a7fb260691759bcc48c371d7c750807ac380b0555594a696840e11bafe"
+KAKAO_REST_KEY = "460dcaf4d435b0dbb26c5a1da3bbd36a"
 
 BASE_URL = "apis.data.go.kr/1613000"
 TIMEOUT = 15
@@ -731,8 +732,42 @@ def _geocode(query, near):
   ]
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def _kakao_search(query, near):
+  """카카오 장소(키워드) 검색. 가까운 곳 위주로 정확도순."""
+  lat, lon = near
+  res = requests.get(
+      "https://dapi.kakao.com/v2/local/search/keyword.json",
+      params={"query": query, "x": lon, "y": lat, "sort": "accuracy", "size": 7},
+      headers={"Authorization": f"KakaoAK {KAKAO_REST_KEY}"},
+      timeout=TIMEOUT,
+  )
+  if res.status_code != 200:
+    try:
+      msg = res.json().get("message", "")
+    except ValueError:
+      msg = res.text[:200]
+    raise ApiError(f"카카오 장소 검색 오류 (HTTP {res.status_code}): {msg}")
+  return [
+      {
+          "name": d.get("place_name") or query,
+          "addr": d.get("road_address_name") or d.get("address_name", ""),
+          "lat": float(d["y"]),
+          "lon": float(d["x"]),
+      }
+      for d in res.json().get("documents", [])
+  ]
+
+
 def geocode(query, near):
-  """도착지 이름 → 좌표 후보 (OpenStreetMap). 실패 시 빈 목록 (캐시하지 않음)."""
+  """도착지 이름 → 좌표 후보. 카카오 장소 검색 우선, 실패하거나 없으면 OpenStreetMap."""
+  near = (round(near[0], 2), round(near[1], 2))
+  try:
+    places = _kakao_search(query, near)
+    if places:
+      return places
+  except (ApiError, requests.RequestException, ValueError, KeyError) as e:
+    st.caption(f"⚠️ {e} — 다른 지도 데이터로 대신 찾습니다.")
   try:
     return _geocode(query, (round(near[0], 1), round(near[1], 1)))
   except (requests.RequestException, ValueError, KeyError):

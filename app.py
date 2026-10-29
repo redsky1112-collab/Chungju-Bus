@@ -1,4 +1,5 @@
 import difflib
+import html
 import math
 import re
 import urllib.parse
@@ -15,14 +16,47 @@ import streamlit as st
 from streamlit_js_eval import get_geolocation
 
 st.set_page_config(
-    page_title="스마트 대중교통 길찾기 & 실시간 안내판",
+    page_title="버스 길잡이",
     page_icon="🚌",
     layout="centered",
     initial_sidebar_state="collapsed",
 )
 
-st.title("🚌 스마트 대중교통 경로 & 실시간 안내판")
-st.caption("💡 실시간 정류소 및 버스 번호 안내 서비스 (네이버지도 길찾기 연동)")
+st.markdown(
+    """<style>
+#MainMenu, footer {visibility: hidden;}
+.block-container {padding-top: 1.5rem; padding-bottom: 4rem; max-width: 680px;}
+h1 {font-size: 1.6rem !important; padding-bottom: 0 !important;}
+h3 {font-size: 1.1rem !important; margin-top: 0.6rem !important;}
+.app-sub {opacity: .65; font-size: .9rem; margin: 2px 0 14px;}
+.card {padding: 12px 14px; border-radius: 14px; border: 1px solid rgba(128,128,128,.25); margin: 4px 0 10px;}
+.stop-name {font-size: 1.2rem; font-weight: 700;}
+.muted {opacity: .65; font-size: .88rem;}
+.dir {margin-top: 4px; font-size: .95rem;}
+.bus-list {display: flex; flex-direction: column; gap: 8px; margin: 6px 0 10px;}
+.bus-row {display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 12px; background: rgba(128,128,128,.09);}
+.badge {display: inline-block; min-width: 52px; text-align: center; padding: 5px 8px; border-radius: 8px; color: #fff; font-weight: 700; font-size: 1rem;}
+.bus-main {flex: 1; line-height: 1.35; min-width: 0;}
+.eta {font-size: 1.15rem; font-weight: 700;}
+.eta.soon {color: #e5484d;}
+.sub {font-size: .85rem; opacity: .7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;}
+.steps {margin: 6px 0 4px;}
+.step {display: flex; gap: 10px; padding: 9px 0; border-bottom: 1px dashed rgba(128,128,128,.25);}
+.step:last-child {border-bottom: none;}
+.dot {flex: none; width: 28px; height: 28px; border-radius: 50%; color: #fff; font-size: .95rem; display: flex; align-items: center; justify-content: center;}
+.step-body {flex: 1; line-height: 1.45; min-width: 0;}
+.step-title {font-weight: 600;}
+.legend span {margin-right: 10px; font-size: .85rem; white-space: nowrap;}
+.legend i {display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 4px; vertical-align: middle;}
+</style>""",
+    unsafe_allow_html=True,
+)
+
+st.title("🚌 버스 길잡이")
+st.markdown(
+    '<div class="app-sub">실시간 도착 · 버스 위치 · 경로 안내</div>',
+    unsafe_allow_html=True,
+)
 
 API_KEY = "9dee46a7fb260691759bcc48c371d7c750807ac380b0555594a696840e11bafe"
 KAKAO_REST_KEY = "460dcaf4d435b0dbb26c5a1da3bbd36a"
@@ -33,6 +67,20 @@ TIMEOUT = 15
 
 class ApiError(Exception):
   pass
+
+
+@st.cache_resource
+def _http():
+  """연결을 재사용하는 HTTP 세션 (매 요청 TLS 연결 비용 절약)."""
+  session = requests.Session()
+  adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16)
+  session.mount("https://", adapter)
+  session.mount("http://", adapter)
+  return session
+
+
+def esc(text):
+  return html.escape(str(text if text is not None else ""))
 
 
 def _parse_xml_error(text):
@@ -58,7 +106,7 @@ def call_api(service, operation, **params):
   for scheme in ("https", "http"):
     url = f"{scheme}://{BASE_URL}/{service}/{operation}"
     try:
-      res = requests.get(url, params=query, timeout=TIMEOUT)
+      res = _http().get(url, params=query, timeout=TIMEOUT)
     except requests.exceptions.RequestException as e:
       last_err = f"{scheme} 연결 실패: {type(e).__name__}"
       continue
@@ -155,6 +203,7 @@ def nearby_stations(lat, lon):
   )
 
 
+@st.cache_data(ttl=20, show_spinner=False)
 def get_arrivals(city_code, node_id):
   return call_api(
       "ArvlInfoInqireService",
@@ -166,6 +215,7 @@ def get_arrivals(city_code, node_id):
   )
 
 
+@st.cache_data(ttl=15, show_spinner=False)
 def get_bus_locations(city_code, route_id):
   return call_api(
       "BusLcInfoInqireService",
@@ -369,9 +419,10 @@ def add_directions(stations, limit=10):
 
 
 def _station_label(s):
-  label = f"{s['nodenm']} (ARS: {s['nodeno']})"
+  label = s["nodenm"]
   if s.get("dir"):
     label += f" → {s['dir']} 방향"
+  label += f" · {s['nodeno']}"
   if s.get("dist") is not None:
     label += f" · {_fmt_dist(s['dist'])}"
   return label
@@ -386,7 +437,7 @@ def _pick(stations, key):
       label = f"{label} [{st_['nodeid']}]"
     options[label] = st_
   label = st.selectbox(
-      "탑승할 승강장을 선택하세요 (→ 진행 방향)", list(options.keys()), key=key
+      "탑승할 승강장 (→ 진행 방향 · ARS 번호)", list(options.keys()), key=key
   )
   return options[label]
 
@@ -407,8 +458,7 @@ def pick_station_by_name(city_code, query, key):
     return None
 
   if used != query.strip():
-    st.info(f"'{query}'와(과) 정확히 일치하는 정류소가 없어 '{used}'(으)로 찾았습니다.")
-  st.success(f"📍 '{query}'와(과) 비슷한 정류소 {len(items)}개 (비슷한 순)")
+    st.caption(f"'{query}'와(과) 정확히 일치하는 정류소가 없어 '{used}'(으)로 찾았습니다.")
   stations = [_station(s, city_code) for s in items]
   return _pick(stations, key)
 
@@ -422,7 +472,7 @@ def pick_station_by_gps(key, trigger):
   if nonce and f"{key}_coords" not in st.session_state:
     loc = get_geolocation(component_key=f"{key}_geo_{nonce}")
     if loc is None:
-      st.info("위치 정보를 가져오는 중입니다... 브라우저에서 위치 권한을 허용해 주세요.")
+      st.caption("📍 위치 확인 중... 브라우저에서 위치 권한을 허용해 주세요.")
       return None
     if "error" in loc:
       st.error(
@@ -458,7 +508,6 @@ def pick_station_by_gps(key, trigger):
     station["me"] = (lat, lon)
     stations.append(station)
   stations.sort(key=lambda s: s["dist"] if s["dist"] is not None else 1e9)
-  st.success(f"📍 현재 위치 근처 정류장 {len(stations)}개 (가까운 순)")
   return _pick(stations, key)
 
 
@@ -480,64 +529,93 @@ def route_context(station, route_id):
 
 def route_contexts(station, arrivals):
   """도착 예정 노선별 진행 방향 정보. 노선정보 API 미신청 시 빈 dict."""
-  contexts = {}
-  for route_id in dict.fromkeys(a.get("routeid") for a in arrivals):
-    try:
-      ctx = route_context(station, route_id)
-    except ApiError as e:
-      if "코드 30" in str(e):
-        st.info(ROUTE_API_HINT)
-        return {}
-      continue
-    if ctx:
-      contexts[route_id] = ctx
-  return contexts
-
-
-def show_direction(contexts):
-  nexts = [c["next"] for c in contexts.values() if c["next"] != "종점"]
-  if not nexts:
-    return
-  main_next = Counter(nexts).most_common(1)[0][0]
-  st.info(
-      f"🧭 이 승강장은 **{main_next}** 방향입니다 (다음 정류장 기준)."
-      " 반대 방향이면 위에서 같은 이름의 다른 승강장을 선택하세요."
+  route_ids = list(dict.fromkeys(a.get("routeid") for a in arrivals))
+  try:  # 권한 오류는 첫 노선으로 먼저 확인
+    first = route_context(station, route_ids[0]) if route_ids else None
+  except ApiError as e:
+    if "코드 30" in str(e):
+      st.info(ROUTE_API_HINT)
+    return {}
+  results = [first] + _fetch_all(
+      route_context, [(station, rid) for rid in route_ids[1:]]
   )
+  return {rid: ctx for rid, ctx in zip(route_ids, results) if ctx}
+
+
+def _main_direction(contexts):
+  nexts = [c["next"] for c in contexts.values() if c["next"] != "종점"]
+  return Counter(nexts).most_common(1)[0][0] if nexts else ""
+
+
+def _route_color(routetp):
+  tp = str(routetp or "")
+  if "급행" in tp:
+    return "#e5484d"
+  if "좌석" in tp or "광역" in tp:
+    return "#7048e8"
+  if "마을" in tp or "지선" in tp:
+    return "#2f9e44"
+  return "#1c6ee8"
+
+
+def _eta_text(sec):
+  if sec < 90:
+    return "곧 도착", True
+  return f"{round(sec / 60)}분", False
 
 
 def show_arrivals(station):
   try:
-    with st.spinner("실시간 도착 정보 조회 중..."):
-      a_items = get_arrivals(station["citycode"], station["nodeid"])
+    a_items = get_arrivals(station["citycode"], station["nodeid"])
   except ApiError as e:
     st.error(str(e))
     return [], {}
 
-  if not a_items:
-    st.info("현재 해당 정류소에 도착 예정인 버스가 없습니다.")
-    return [], {}
+  contexts = {}
+  if a_items:
+    with st.spinner("진행 방향 확인 중..."):
+      contexts = route_contexts(station, a_items)
 
-  with st.spinner("진행 방향 확인 중..."):
-    contexts = route_contexts(station, a_items)
-  show_direction(contexts)
+  direction = _main_direction(contexts) or station.get("dir")
+  now = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%H:%M:%S")
+  dir_html = f'<div class="dir">➡️ <b>{esc(direction)}</b> 방향</div>' if direction else ""
+  st.markdown(
+      f'<div class="card"><div class="stop-name">🚏 {esc(station["nodenm"])}</div>'
+      f'<div class="muted">ARS {esc(station["nodeno"])} · {now} 기준</div>{dir_html}</div>',
+      unsafe_allow_html=True,
+  )
+
+  if not a_items:
+    st.info("지금 이 승강장에 도착 예정인 버스가 없습니다.")
+    return [], contexts
 
   a_items.sort(key=lambda x: _to_int(x.get("arrtime")))
   rows = []
   for item in a_items:
     sec = _to_int(item.get("arrtime"))
-    row = {
-        "버스번호": item.get("routeno"),
-        "남은 시간": f"약 {sec // 60}분 ({sec}초 후)",
-        "남은 정류장": f"{item.get('arrprevstationcnt', '-')}개 전",
-    }
-    if contexts:
-      ctx = contexts.get(item.get("routeid"))
-      row["다음 정류장(방향)"] = ctx["next"] if ctx else "-"
-    row["차량 유형"] = item.get("vehicletp", "일반")
-    rows.append(row)
-  st.markdown(f"### 🚍 [{station['nodenm']}] 실시간 버스 도착 정보")
-  st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+    eta, soon = _eta_text(sec)
+    sub = [f"{esc(item.get('arrprevstationcnt', '-'))}정거장 전"]
+    ctx = contexts.get(item.get("routeid"))
+    if ctx and ctx["next"]:
+      sub.append(f"→ {esc(ctx['next'])}")
+    if item.get("vehicletp"):
+      sub.append(esc(item.get("vehicletp")))
+    rows.append(
+        f'<div class="bus-row"><span class="badge" style="background:'
+        f'{_route_color(item.get("routetp"))}">{esc(item.get("routeno"))}</span>'
+        f'<div class="bus-main"><div class="eta{" soon" if soon else ""}">{eta}</div>'
+        f'<div class="sub">{" · ".join(sub)}</div></div></div>'
+    )
+  st.markdown(f'<div class="bus-list">{"".join(rows)}</div>', unsafe_allow_html=True)
   return a_items, contexts
+
+
+def _legend(items):
+  spans = "".join(
+      f'<span><i style="background:rgb({c[0]},{c[1]},{c[2]})"></i>{esc(t)}</span>'
+      for c, t in items
+  )
+  st.markdown(f'<div class="legend">{spans}</div>', unsafe_allow_html=True)
 
 
 MARKER_COLORS = {
@@ -549,8 +627,11 @@ MARKER_COLORS = {
 MARKER_PIXELS = {"station": 11, "next": 10, "bus": 8, "me": 7}
 
 
-def show_bus_location(station, arrivals, contexts, key, preferred_route=None):
-  st.markdown("### 🗺️ 버스 위치 보기")
+@st.fragment
+def show_bus_location(station, arrivals, contexts, key):
+  if not st.toggle("🗺️ 버스 실시간 위치 보기", key=f"{key}_on"):
+    return
+  preferred_route = st.session_state.get("preferred_route")
   options = {}
   # 경로 안내에서 고른 버스를 맨 앞에
   arrivals = sorted(arrivals, key=lambda a: a.get("routeid") != preferred_route)
@@ -559,7 +640,7 @@ def show_bus_location(station, arrivals, contexts, key, preferred_route=None):
     label = f"{item.get('routeno')}번 · 약 {sec // 60}분 후 도착"
     options.setdefault(label, item)
   label = st.selectbox(
-      "위치를 볼 버스를 선택하세요",
+      "버스 선택",
       list(options.keys()),
       key=f"{key}_{preferred_route}",
   )
@@ -601,10 +682,6 @@ def show_bus_location(station, arrivals, contexts, key, preferred_route=None):
       last_passed = min(passed, key=lambda b: b["_ord"])
       buses = [b for b in buses if b["_ord"] <= ctx["ord"] or b is last_passed]
 
-  st.caption(
-      f"가장 먼저 오는 {routeno}번은 약 {_to_int(item.get('arrtime')) // 60}분 후,"
-      f" {item.get('arrprevstationcnt', '-')}개 전 정류장에 있습니다."
-  )
 
   rows, points = [], []
   for b in buses:
@@ -620,9 +697,9 @@ def show_bus_location(station, arrivals, contexts, key, preferred_route=None):
       status = "-"
     rows.append({
         "상태": status,
-        "차량번호": b.get("vehicleno"),
-        "현재 위치(정류장)": b.get("nodenm"),
-        "내 정류장까지 직선거리": _fmt_dist(dist),
+        "현재 위치": b.get("nodenm"),
+        "거리": _fmt_dist(dist),
+        "차량": b.get("vehicleno"),
         "_sort": (
             ["🟠 곧 도착", "오는 중", "-", "지나감"].index(status),
             dist if dist is not None else 1e9,
@@ -659,12 +736,12 @@ def show_bus_location(station, arrivals, contexts, key, preferred_route=None):
   if not points:
     return
 
-  legend = ["🔴 **출발 정류장**", "🔵 **운행 중인 버스**"]
+  legend = [(MARKER_COLORS["station"], "내 정류장"), (MARKER_COLORS["bus"], "운행 중")]
   if next_bus is not None:
-    legend.insert(1, "🟠 **곧 도착할 버스**")
+    legend.insert(1, (MARKER_COLORS["next"], "곧 도착"))
   if station.get("me"):
-    legend.append("🟢 **내 현재 위치**")
-  st.markdown("지도 표시: " + " · ".join(legend))
+    legend.append((MARKER_COLORS["me"], "내 위치"))
+  _legend(legend)
 
   pts = pd.DataFrame(points)
   center_lat = station["lat"] or pts["lat"].mean()
@@ -699,13 +776,12 @@ def show_bus_location(station, arrivals, contexts, key, preferred_route=None):
           tooltip={"text": "{label}"},
       )
   )
-  st.caption("점을 누르면 무엇인지 표시됩니다.")
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def _geocode(query, near):
   lat, lon = near
-  res = requests.get(
+  res = _http().get(
       "https://nominatim.openstreetmap.org/search",
       params={
           "q": query,
@@ -736,7 +812,7 @@ def _geocode(query, near):
 def _kakao_search(query, near):
   """카카오 장소(키워드) 검색. 가까운 곳 위주로 정확도순."""
   lat, lon = near
-  res = requests.get(
+  res = _http().get(
       "https://dapi.kakao.com/v2/local/search/keyword.json",
       params={"query": query, "x": lon, "y": lat, "sort": "accuracy", "size": 7},
       headers={"Authorization": f"KakaoAK {KAKAO_REST_KEY}"},
@@ -762,12 +838,17 @@ def _kakao_search(query, near):
 def geocode(query, near):
   """도착지 이름 → 좌표 후보. 카카오 장소 검색 우선, 실패하거나 없으면 OpenStreetMap."""
   near = (round(near[0], 2), round(near[1], 2))
-  try:
-    places = _kakao_search(query, near)
-    if places:
-      return places
-  except (ApiError, requests.RequestException, ValueError, KeyError) as e:
-    st.caption(f"⚠️ {e} — 다른 지도 데이터로 대신 찾습니다.")
+  kakao_err = st.session_state.get("kakao_err")
+  if not kakao_err:
+    try:
+      places = _kakao_search(query, near)
+      if places:
+        return places
+    except (ApiError, requests.RequestException, ValueError, KeyError) as e:
+      # 설정 오류는 다시 시도해도 같으므로 이 접속 동안은 건너뛴다
+      kakao_err = st.session_state["kakao_err"] = str(e)
+  if kakao_err:
+    st.caption(f"⚠️ {kakao_err} — 다른 지도 데이터로 대신 찾습니다.")
   try:
     return _geocode(query, (round(near[0], 1), round(near[1], 1)))
   except (requests.RequestException, ValueError, KeyError):
@@ -853,17 +934,13 @@ def pick_destination(station, destination):
 
 def show_naver_buttons(station, place):
   url = naver_route_url(station, place)
+  web = "https://map.naver.com/p/search/" + urllib.parse.quote(place["name"])
   if url:
-    st.link_button(
-        f"🧭 네이버지도로 길찾기: {station['nodenm']} → {place['name']}",
-        url,
-        width="stretch",
-    )
-  st.link_button(
-      f"🗺️ 네이버지도 웹에서 '{place['name']}' 찾기",
-      "https://map.naver.com/p/search/" + urllib.parse.quote(place["name"]),
-      width="stretch",
-  )
+    col_app, col_web = st.columns(2)
+    col_app.link_button("🧭 네이버지도 앱", url, width="stretch")
+    col_web.link_button("🌐 네이버지도 웹", web, width="stretch")
+  else:
+    st.link_button("🌐 네이버지도에서 보기", web, width="stretch")
 
 
 # ------------------------------------------
@@ -1104,9 +1181,8 @@ def _total_minutes(o):
 
 def _option_title(o):
   buses = " → ".join(f"{leg['routeno']}번" for leg in o["legs"])
-  kind = "직행" if len(o["legs"]) == 1 else "1회 환승"
-  n = sum(len(leg["stops"]) - 1 for leg in o["legs"])
-  return f"{buses} ({kind}) · {n}개 정류장 · 약 {round(_total_minutes(o))}분"
+  kind = "직행" if len(o["legs"]) == 1 else "환승 1회"
+  return f"{buses} · {kind} · 약 {round(_total_minutes(o))}분"
 
 
 def _clock(t):
@@ -1122,51 +1198,76 @@ ROUTE_COLORS = {
 LEG_COLORS = [[20, 100, 230], [0, 170, 170]]  # 1번째 버스 파랑, 2번째 버스 청록
 
 
+STEP_COLORS = {
+    "walk": "#868e96",
+    "board": "#2f9e44",
+    "ride": "#1c6ee8",
+    "transfer": "#f08c00",
+    "alight": "#e5484d",
+    "finish": "#7048e8",
+}
+STEP_ICONS = {
+    "walk": "🚶", "board": "🚌", "ride": "⋮", "transfer": "🔁",
+    "alight": "🔔", "finish": "🏁",
+}
+
+
+def _steps_html(steps):
+  rows = "".join(
+      f'<div class="step"><div class="dot" style="background:{STEP_COLORS[kind]}">'
+      f'{STEP_ICONS[kind]}</div><div class="step-body"><div class="step-title">{title}</div>'
+      + (f'<div class="sub" style="white-space:normal">{sub}</div>' if sub else "")
+      + "</div></div>"
+      for kind, title, sub in steps
+  )
+  return f'<div class="card steps">{rows}</div>'
+
+
+@st.fragment
 def show_route_guide(station, place, arrivals):
-  """출발 승강장 → 도착지 시내버스 경로 안내. 선택한 경로의 첫 노선 id를 돌려준다."""
-  st.markdown(f"### 🚏 경로 안내: {station['nodenm']} → {place['name']}")
+  """출발 승강장 → 도착지 시내버스 경로 안내. 고른 경로의 첫 노선을 세션에 기록한다."""
+  st.markdown(f"### 🧭 {esc(station['nodenm'])} → {esc(place['name'])}")
+  st.session_state["preferred_route"] = None
   if not (station["lat"] and station["lon"]):
     st.info("이 정류장의 위치 정보가 없어 경로를 계산할 수 없습니다.")
-    return None
+    return
 
-  with st.spinner("시내버스 경로 찾는 중... (처음에는 10초 정도 걸릴 수 있어요)"):
+  with st.spinner("경로 찾는 중... (처음에는 10초 정도 걸릴 수 있어요)"):
     try:
       options = plan_routes(station, place)
     except Exception as e:  # 경로 계산 실패가 화면 전체를 멈추지 않도록
       st.warning(f"경로를 계산하지 못했습니다: {e}")
-      return None
+      return
 
   if not options:
     st.info(
-        "시내버스로 갈 수 있는 경로(직행 또는 1회 환승)를 찾지 못했습니다."
-        " 다른 지역이나 먼 곳이라면 아래 네이버지도 길찾기를 이용하세요."
+        "시내버스 경로(직행·환승 1회)를 찾지 못했습니다."
+        " 먼 곳이라면 아래 네이버지도로 확인하세요."
     )
-    return None
+    return
 
-  titles = [f"{n}. {_option_title(o)}" for n, o in enumerate(options, 1)]
-  choice = st.radio("경로 선택", titles, key="route_choice")
+  titles = [_option_title(o) for o in options]
+  choice = st.radio("경로", titles, key="route_choice", label_visibility="collapsed")
   o = options[titles.index(choice)]
 
   arrival_by_route = {}
   for a in arrivals:
     arrival_by_route.setdefault(a.get("routeid"), a)
 
-  steps = []
+  steps = []  # (종류, 제목 html, 보조 설명 html)
   board = o["board"]
   first = o["legs"][0]
-  if board["nodeid"] != station["nodeid"]:
-    steps.append(
-        f"🚶 근처 **{board['nodenm']}** 승강장(ARS {board['nodeno']})으로 이동하세요"
-        f" — {_fmt_walk(o['walk_start'])}"
-    )
+  same_stop = board["nodeid"] == station["nodeid"]
+  if not same_stop:
+    steps.append((
+        "walk",
+        f"근처 <b>{esc(board['nodenm'])}</b> 승강장으로 이동",
+        f"ARS {esc(board['nodeno'])} · {_fmt_walk(o['walk_start'])}",
+    ))
 
   # 첫 버스 도착 정보가 있으면 정류장별 예상 시각을 계산한다
   now = datetime.now(ZoneInfo("Asia/Seoul"))
-  first_arrival = (
-      arrival_by_route.get(first["routeid"])
-      if board["nodeid"] == station["nodeid"]
-      else None
-  )
+  first_arrival = arrival_by_route.get(first["routeid"]) if same_stop else None
   leg_start = (
       now + timedelta(seconds=_to_int(first_arrival.get("arrtime")))
       if first_arrival
@@ -1179,63 +1280,63 @@ def show_route_guide(station, place, arrivals):
     rides = len(leg["stops"]) - 1
     ride_min = leg["times"][-1]
     toward = leg["stops"][1].get("nodenm") if rides >= 1 else ""
+    bus = f'<b>{esc(leg["routeno"])}번</b>'
     if n > 0 and leg_start:
       leg_start += timedelta(
           minutes=o["walk_transfer"] / WALK_M_PER_MIN + TRANSFER_WAIT_MIN
       )
     leg_starts.append(leg_start)
     if n == 0:
-      wait = ""
+      sub = f"{esc(toward)} 방향"
       if first_arrival:
-        wait = (
-            f" — ⏱ 약 {_to_int(first_arrival.get('arrtime')) // 60}분 후"
-            f" ({_clock(leg_start)}) 도착"
+        sub = (
+            f"⏱ {_eta_text(_to_int(first_arrival.get('arrtime')))[0]}"
+            f" ({_clock(leg_start)}) · " + sub
         )
-      steps.append(
-          f"🟢 **{_stop_label(on)}**에서 **{leg['routeno']}번** 승차"
-          f" ({toward} 방향){wait}"
-      )
+      steps.append(("board", f"<b>{esc(_stop_label(on))}</b>에서 {bus} 승차", sub))
     else:
       prev_off = o["legs"][n - 1]["stops"][-1]
       if prev_off.get("nodeid") == on.get("nodeid"):
         where = "같은 정류장에서"
       else:
-        where = f"{_fmt_walk(o['walk_transfer'])} 걸어서 **{_stop_label(on)}**에서"
-      steps.append(
-          f"🟠 **환승**: {where} **{leg['routeno']}번** 승차 ({toward} 방향)"
-      )
+        where = f"<b>{esc(_stop_label(on))}</b>에서"
+      walk = "" if prev_off.get("nodeid") == on.get("nodeid") else _fmt_walk(o["walk_transfer"]) + " · "
+      steps.append((
+          "transfer", f"{where} {bus}으로 환승", f"{walk}{esc(toward)} 방향"
+      ))
+    off_at = f" · 예상 {_clock(leg_start + timedelta(minutes=ride_min))}" if leg_start else ""
+    steps.append((
+        "ride", f"{rides}정거장 · 약 {max(1, round(ride_min))}분", ""
+    ))
     before = leg["stops"][-2].get("nodenm") if rides >= 2 else None
-    bell = f" — 🔔 '{before}' 지나면 하차벨" if before else ""
-    icon = "🔴" if n == len(o["legs"]) - 1 else "🟠"
-    off_at = (
-        f" (예상 {_clock(leg_start + timedelta(minutes=ride_min))})"
-        if leg_start else ""
-    )
-    steps.append(
-        f"🚌 {rides}개 정류장, 약 {max(1, round(ride_min))}분 이동 → {icon}"
-        f" **{_stop_label(off)}** 하차{off_at}{bell}"
-    )
+    steps.append((
+        "alight",
+        f"<b>{esc(_stop_label(off))}</b> 하차",
+        (f"'{esc(before)}' 지나면 하차벨" if before else "다음 정류장에서 하차벨") + off_at,
+    ))
     if leg_start:
       leg_start += timedelta(minutes=ride_min)
 
   arrive_at = (
-      f" — 예상 도착 {_clock(leg_start + timedelta(minutes=o['walk_end'] / WALK_M_PER_MIN))}"
+      f"예상 도착 {_clock(leg_start + timedelta(minutes=o['walk_end'] / WALK_M_PER_MIN))}"
       if leg_start else ""
   )
   if o["walk_end"] < 50:
-    steps.append(f"🏁 **{place['name']}** 도착{arrive_at}")
+    steps.append(("finish", f"<b>{esc(place['name'])}</b> 도착", arrive_at))
   else:
-    steps.append(
-        f"🏁 **{place['name']}**까지 걸어서 {_fmt_walk(o['walk_end'])}{arrive_at}"
-    )
-  st.markdown("\n".join(f"{n}. {step}" for n, step in enumerate(steps, 1)))
+    walk = _fmt_walk(o["walk_end"])
+    steps.append((
+        "finish",
+        f"<b>{esc(place['name'])}</b>까지 걸어서",
+        f"{walk} · {arrive_at}" if arrive_at else walk,
+    ))
+  st.markdown(_steps_html(steps), unsafe_allow_html=True)
   if not first_arrival:
-    st.caption("첫 버스 도착 정보가 없어 예상 시각 대신 승차 후 걸리는 시간만 표시합니다.")
+    st.caption("첫 버스 도착 정보가 없어 예상 시각 없이 걸리는 시간만 표시합니다.")
 
   for leg, start_at in zip(o["legs"], leg_starts):
     with st.expander(
-        f"🕒 {leg['routeno']}번 정류장별 소요시간 보기"
-        f" ({len(leg['stops']) - 1}개 정류장, 약 {max(1, round(leg['times'][-1]))}분)"
+        f"🕒 {leg['routeno']}번 정류장별 시간 ({len(leg['stops']) - 1}정거장)"
     ):
       lines = []
       last = len(leg["stops"]) - 1
@@ -1246,10 +1347,12 @@ def show_route_guide(station, place, arrivals):
         when = f"{_clock(start_at + timedelta(minutes=t))} · " if start_at else ""
         lines.append(f"- {when}+{round(t)}분 · {name}")
       st.markdown("\n".join(lines))
-      st.caption("거리와 평균 속도로 계산한 예상 시간이라 실제와 다를 수 있습니다.")
+      st.caption("거리와 평균 속도로 계산한 예상 시간입니다.")
 
-  show_route_map(o, place)
-  return first["routeid"] if board["nodeid"] == station["nodeid"] else None
+  if st.toggle("🗺️ 경로 지도 보기", key="route_map_on"):
+    show_route_map(o, place)
+  if same_stop:
+    st.session_state["preferred_route"] = first["routeid"]
 
 
 def show_route_map(o, place):
@@ -1304,10 +1407,14 @@ def show_route_map(o, place):
             pickable=True,
         )
     )
-  legend = "🟢 **승차** · 🔴 **하차** · 🟣 **도착지** · 🟦 **버스 노선**"
+  legend = [(ROUTE_COLORS["board"], "승차")]
   if len(o["legs"]) > 1:
-    legend = "🟢 **승차** · 🟠 **환승** · 🔴 **하차** · 🟣 **도착지** · 🟦 **1번째 버스** · 🩵 **2번째 버스**"
-  st.markdown("경로 지도: " + legend)
+    legend.append((ROUTE_COLORS["transfer"], "환승"))
+  legend += [(ROUTE_COLORS["alight"], "하차"), (ROUTE_COLORS["dest"], "도착지")]
+  legend += [
+      (LEG_COLORS[n % 2], f"{leg['routeno']}번") for n, leg in enumerate(o["legs"])
+  ]
+  _legend(legend)
   st.pydeck_chart(
       pdk.Deck(
           layers=layers,
@@ -1323,44 +1430,36 @@ city_dict, city_err = get_city_list()
 if city_err:
   st.warning(f"도시 목록을 불러오지 못해 기본 목록을 사용합니다.\n\n{city_err}")
 
-default_idx = 0
-for idx, name in enumerate(city_dict.keys()):
-  if "청주" in name:
-    default_idx = idx
-    break
+city_names = list(city_dict.keys())
+default_idx = next((i for i, n in enumerate(city_names) if "청주" in n), 0)
 
-st.subheader("🧭 출발 정류소 실시간 버스 번호 찾기")
-st.write(
-    "**출발지**에 정류장 이름(일부만 입력해도 됨)이나 ARS 번호를 입력하거나,"
-    " **내 위치**로 가까운 정류장을 찾으세요."
-)
-
-selected_city_t1 = st.selectbox(
-    "지역 선택 (이름 검색용)",
-    list(city_dict.keys()),
-    index=default_idx,
-    key="city_t1",
-)
-start_station = st.text_input(
-    "출발지 (입력 후 엔터)",
-    value="",
-    placeholder="예: 오송역, 대광로제비앙, 3223",
-    key="start_stn",
-)
-destination = st.text_input(
-    "도착지 (네이버지도 대중교통 길찾기용)",
-    value="",
-    placeholder="예: 대전역, 서울고속버스터미널, 청주롯데아울렛",
-    key="dest_stn",
-)
-
-col_search, col_gps = st.columns(2)
-search_clicked = col_search.button(
-    "🔎 출발지로 검색", width="stretch", key="btn_t1"
-)
-gps_clicked = col_gps.button(
-    "📍 내 위치로 찾기", width="stretch", key="gps_t1_btn"
-)
+with st.container(border=True):
+  start_station = st.text_input(
+      "출발지",
+      value="",
+      placeholder="정류장 이름 또는 ARS 번호 (예: 오송역, 3223)",
+      key="start_stn",
+  )
+  col_search, col_gps = st.columns(2)
+  search_clicked = col_search.button(
+      "🔎 검색", width="stretch", key="btn_t1", type="primary"
+  )
+  gps_clicked = col_gps.button("📍 내 위치", width="stretch", key="gps_t1_btn")
+  destination = st.text_input(
+      "도착지 (선택)",
+      value="",
+      placeholder="장소·정류장 (예: 청주롯데아울렛, 대전역)",
+      key="dest_stn",
+  )
+  with st.expander(f"지역: {city_names[st.session_state.get('city_idx', default_idx)].split(' (')[0]}"):
+    selected_city_t1 = st.selectbox(
+        "지역 (이름 검색용)",
+        city_names,
+        index=default_idx,
+        key="city_t1",
+        label_visibility="collapsed",
+    )
+    st.session_state["city_idx"] = city_names.index(selected_city_t1)
 
 # 엔터로 입력을 바꿔도 바로 검색
 typed = start_station.strip() and start_station != st.session_state.get("last_q_t1")
@@ -1373,7 +1472,7 @@ if search_clicked or typed:
         start_station.strip(),
     )
   else:
-    st.warning("출발지를 입력하거나 '📍 내 위치로 찾기'를 눌러 주세요.")
+    st.warning("출발지를 입력하거나 '📍 내 위치'를 눌러 주세요.")
     st.session_state.pop("src_t1", None)
 if gps_clicked:
   st.session_state["src_t1"] = ("gps",)
@@ -1387,14 +1486,16 @@ elif src:
 
 if station:
   arrivals, contexts = show_arrivals(station)
-  preferred = None
+  if st.button("🔄 새로고침", key="refresh_t1", width="stretch"):
+    get_arrivals.clear()
+    get_bus_locations.clear()
+    st.rerun()
   place = pick_destination(station, destination)
   if place:
-    preferred = show_route_guide(station, place, arrivals)
+    show_route_guide(station, place, arrivals)
     show_naver_buttons(station, place)
   if arrivals:
-    show_bus_location(
-        station, arrivals, contexts, key="bus_t1", preferred_route=preferred
-    )
-  if st.button("🔄 새로고침", key="refresh_t1"):
-    st.rerun()
+    st.divider()
+    show_bus_location(station, arrivals, contexts, key="bus_t1")
+else:
+  st.caption("출발 정류장을 검색하거나 📍 내 위치로 가까운 정류장을 찾아보세요.")
